@@ -30,15 +30,22 @@ jobs:
           node-version: 24.18.0
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        shell: bash
+        run: |
+          set +e
+          pnpm install --no-frozen-lockfile 2>&1 | tee install.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
 
-      - name: Upload bootstrap lockfile
-        if: always() && hashFiles('pnpm-lock.yaml') != ''
+      - name: Upload bootstrap artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pnpm-lock
-          path: pnpm-lock.yaml
-          if-no-files-found: error
+          name: bootstrap-diagnostics
+          path: |
+            pnpm-lock.yaml
+            install.log
+          if-no-files-found: warn
           retention-days: 3
 
       - name: Validate Compose file
@@ -82,4 +89,6 @@ jobs:
 
       - name: Stop Compose stack
         if: always()
+        env:
+          POSTGRES_PASSWORD: ci-only-password
         run: docker compose down --volumes
