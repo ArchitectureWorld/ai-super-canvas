@@ -8,7 +8,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
@@ -33,30 +33,16 @@ jobs:
         shell: bash
         run: |
           set +e
-          pnpm install --no-frozen-lockfile 2>&1 | tee install.log
+          pnpm install --frozen-lockfile 2>&1 | tee install.log
           status=${PIPESTATUS[0]}
           exit "$status"
 
-      - name: Commit bootstrap lockfile
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/feat/')
-        run: |
-          if [ -z "$(git status --porcelain -- pnpm-lock.yaml)" ]; then
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pnpm-lock.yaml
-          git commit -m "chore: add pnpm lockfile"
-          git push
-
-      - name: Upload bootstrap artifacts
-        if: always()
+      - name: Upload install diagnostics
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: bootstrap-diagnostics
-          path: |
-            pnpm-lock.yaml
-            install.log
+          name: install-diagnostics
+          path: install.log
           if-no-files-found: warn
           retention-days: 3
 
