@@ -29,14 +29,20 @@ git switch feat/feature-01-mvp
 cp .env.example .env
 ```
 
-编辑 `.env`，至少替换数据库密码：
+生成 URL-safe 数据库密码：
+
+```bash
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+```
+
+将输出写入 `.env`。数据库密码只使用字母、数字、连字符和下划线，避免未经编码的 `@`、`:`、`/` 等字符破坏 `DATABASE_URL`。
 
 ```dotenv
 APP_BIND_ADDRESS=127.0.0.1
 APP_PORT=3000
 APP_OWNER_ID=local-owner
 POSTGRES_USER=canvas
-POSTGRES_PASSWORD=使用密码管理器生成的长随机密码
+POSTGRES_PASSWORD=上一步生成的URL安全随机字符串
 POSTGRES_DB=canvas
 OPENAI_API_KEY=
 OPENAI_MODEL=
@@ -122,10 +128,12 @@ services:
 
 ```bash
 mkdir -p backups
-docker compose exec -T postgres \
-  pg_dump -U "${POSTGRES_USER:-canvas}" -d "${POSTGRES_DB:-canvas}" \
-  --format=custom > "backups/canvas-$(date +%Y%m%d-%H%M%S).dump"
+docker compose exec -T postgres sh -c \
+  'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' \
+  > "backups/canvas-$(date +%Y%m%d-%H%M%S).dump"
 ```
+
+这个命令读取 PostgreSQL 容器内的真实环境变量，因此即使 `.env` 修改了数据库名或用户，也不会错误地回退到默认值。
 
 ### 6.2 恢复演练
 
