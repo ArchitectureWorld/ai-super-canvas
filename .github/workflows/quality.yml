@@ -40,7 +40,7 @@ jobs:
       - name: Commit bootstrap lockfile
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/feat/')
         run: |
-          if git diff --quiet -- pnpm-lock.yaml; then
+          if [ -z "$(git status --porcelain -- pnpm-lock.yaml)" ]; then
             exit 0
           fi
           git config user.name "github-actions[bot]"
