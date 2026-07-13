@@ -17,25 +17,26 @@ Task 1 的部署基线面向：
 - Docker Compose v2；
 - 至少 2 GB 可用内存；
 - 至少 10 GB 可用磁盘空间；
-- NAS 数据盘应启用定期快照或外部备份。
+- NAS 数据盘应启用定期快照或外部备份；
+- GitHub 已配置访问私有仓库的凭据。
 
 ## 3. 首次启动
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/ArchitectureWorld/ai-super-canvas.git
 cd ai-super-canvas
 git switch feat/feature-01-mvp
 cp .env.example .env
 ```
 
-编辑 `.env`：
+编辑 `.env`，至少替换数据库密码：
 
 ```dotenv
 APP_BIND_ADDRESS=127.0.0.1
 APP_PORT=3000
 APP_OWNER_ID=local-owner
 POSTGRES_USER=canvas
-POSTGRES_PASSWORD=<long-random-password>
+POSTGRES_PASSWORD=使用密码管理器生成的长随机密码
 POSTGRES_DB=canvas
 OPENAI_API_KEY=
 OPENAI_MODEL=
@@ -145,13 +146,9 @@ docker compose up -d
 docker image prune -f
 ```
 
-更新前先备份 PostgreSQL。涉及数据库迁移的版本必须先阅读 Release Notes，并运行：
+更新前先备份 PostgreSQL。
 
-```bash
-docker compose run --rm app pnpm db:migrate
-```
-
-Task 1 尚未发布领域表迁移，因此当前不执行该命令。
+Task 1 的运行镜像只包含生产应用，不包含 pnpm 和源码，因此不能在 `app` 容器内临时执行迁移。后续引入领域表时，仓库会增加独立的 migration image / Compose profile；在此之前没有数据库迁移需要执行。
 
 ## 8. 日志与排查
 
