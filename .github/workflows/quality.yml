@@ -32,6 +32,15 @@ jobs:
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
 
+      - name: Upload bootstrap lockfile
+        if: always() && hashFiles('pnpm-lock.yaml') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pnpm-lock
+          path: pnpm-lock.yaml
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Validate Compose file
         env:
           POSTGRES_PASSWORD: ci-only-password
