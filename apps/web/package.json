@@ -1,0 +1,32 @@
+{
+  "name": "@ai-super-canvas/web",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -H 0.0.0.0",
+    "build": "next build",
+    "start": "next start -H 0.0.0.0",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@ai-super-canvas/ai": "workspace:*",
+    "@ai-super-canvas/core": "workspace:*",
+    "@ai-super-canvas/db": "workspace:*",
+    "next": "16.2.10",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.2.10",
+    "tailwindcss": "4.3.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.10"
+  }
+}
