@@ -7,7 +7,7 @@ export function GET() {
     {
       status: 'ok',
       service: 'ai-super-canvas-web',
-      phase: 'feature-01-scaffold',
+      phase: 'gate-0-interactive-slice',
       timestamp: new Date().toISOString(),
     },
     {

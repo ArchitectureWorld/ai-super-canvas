@@ -2,8 +2,8 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'AI Super Canvas',
-  description: 'A unified organic workspace for non-linear AI collaboration.',
+  title: 'AI Super Canvas · Gate 0',
+  description: '可回写的 AI 协作工作台交互纵切。',
 };
 
 export default function RootLayout({
