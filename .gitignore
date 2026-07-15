@@ -43,3 +43,4 @@ tmp/
 .cache/
 *.tsbuildinfo
 .codebase-memory/
+.superpowers/
