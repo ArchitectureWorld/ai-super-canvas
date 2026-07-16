@@ -75,6 +75,55 @@ test('runs the structured growth golden path in a browser', async ({ page }) => 
   await expect(page.getByRole('textbox', { name: '主干活文档' })).toHaveValue(/## 关于/);
 });
 
+test('zooms around the pointer without hijacking panel or horizontal wheel input', async ({ page }) => {
+  await page.goto('/');
+
+  const stage = page.getByLabel('结构化生长画布');
+  const plane = page.getByTestId('canvas-plane');
+  const stageBox = await stage.boundingBox();
+  if (!stageBox) throw new Error('画布未渲染');
+  const pointer = {
+    x: stageBox.x + stageBox.width - 280,
+    y: stageBox.y + stageBox.height / 2,
+  };
+  const readPointerWorldPosition = () => plane.evaluate((element, clientPoint) => {
+    const stageElement = element.parentElement;
+    if (!stageElement) throw new Error('画布平面缺少容器');
+    const stageRect = stageElement.getBoundingClientRect();
+    const matrix = new DOMMatrixReadOnly(getComputedStyle(element).transform);
+    const localX = clientPoint.x - stageRect.left - stageElement.clientLeft;
+    const localY = clientPoint.y - stageRect.top - stageElement.clientTop;
+    return {
+      scale: matrix.a,
+      transform: getComputedStyle(element).transform,
+      worldX: (localX - matrix.e) / matrix.a,
+      worldY: (localY - matrix.f) / matrix.d,
+    };
+  }, pointer);
+
+  await page.mouse.move(pointer.x, pointer.y);
+  const beforeZoom = await readPointerWorldPosition();
+  await page.mouse.wheel(0, -40);
+  await expect.poll(async () => (await readPointerWorldPosition()).scale).toBeGreaterThan(beforeZoom.scale);
+  const afterZoom = await readPointerWorldPosition();
+  expect(afterZoom.worldX).toBeCloseTo(beforeZoom.worldX, 3);
+  expect(afterZoom.worldY).toBeCloseTo(beforeZoom.worldY, 3);
+
+  const beforeHorizontalWheel = afterZoom.transform;
+  await page.mouse.wheel(80, 0);
+  await expect.poll(() => plane.evaluate((element) => getComputedStyle(element).transform))
+    .toBe(beforeHorizontalWheel);
+
+  const panel = page.getByLabel('节点设置');
+  const panelBox = await panel.boundingBox();
+  if (!panelBox) throw new Error('节点设置未渲染');
+  await page.mouse.move(panelBox.x + panelBox.width / 2, panelBox.y + panelBox.height / 2);
+  const beforePanelWheel = await plane.evaluate((element) => getComputedStyle(element).transform);
+  await page.mouse.wheel(0, 100);
+  await expect.poll(() => plane.evaluate((element) => getComputedStyle(element).transform))
+    .toBe(beforePanelWheel);
+});
+
 test('shows the composer only inside the selected branch panel', async ({ page }) => {
   await page.goto('/');
 
