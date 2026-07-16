@@ -23,7 +23,16 @@
 - [ ] **Step 1: Write failing state tests**
 
 ```ts
-expect(panCanvas(initialCanvasLayout(), { x: 96, y: -28 }).viewport).toMatchObject({ x: 96, y: -28 });
+const initial = {
+  ...initialCanvasLayout(),
+  viewport: { x: 40, y: -20, zoom: 1 },
+};
+const gesture = { startX: 100, startY: 80, baseX: 40, baseY: -20 };
+const afterFirstMove = panCanvas(initial, gesture, { x: 112, y: 88 });
+const afterSecondMove = panCanvas(afterFirstMove, gesture, { x: 130, y: 105 });
+
+expect(afterFirstMove.viewport).toEqual({ x: 52, y: -12, zoom: 1 });
+expect(afterSecondMove.viewport).toEqual({ x: 70, y: 5, zoom: 1 });
 expect(setCanvasNodeModel(initialCanvasLayout(), 'branch-1', 'gpt-5-mini').modelByNodeId).toEqual({ 'branch-1': 'gpt-5-mini' });
 ```
 
@@ -36,8 +45,26 @@ Expected: failure because `panCanvas` and `setCanvasNodeModel` are not exported.
 - [ ] **Step 3: Implement immutable pan and per-node model helpers**
 
 ```ts
-export function panCanvas(state: CanvasLayoutState, delta: { x: number; y: number }): CanvasLayoutState {
-  return { ...state, viewport: { ...state.viewport, x: state.viewport.x + delta.x, y: state.viewport.y + delta.y } };
+export interface CanvasPanGesture {
+  startX: number;
+  startY: number;
+  baseX: number;
+  baseY: number;
+}
+
+export function panCanvas(
+  state: CanvasLayoutState,
+  gesture: CanvasPanGesture,
+  pointer: { x: number; y: number },
+): CanvasLayoutState {
+  return {
+    ...state,
+    viewport: {
+      ...state.viewport,
+      x: gesture.baseX + pointer.x - gesture.startX,
+      y: gesture.baseY + pointer.y - gesture.startY,
+    },
+  };
 }
 
 export function setCanvasNodeModel(state: CanvasLayoutState, nodeId: string, model: string): CanvasLayoutState {
@@ -114,21 +141,25 @@ Expected: PASS.
 - [ ] **Step 2: Keep a short right-click as a menu, and make long-press-plus-drag pan**
 
 ```tsx
-onPointerDown={(event) => {
-  if (event.button !== 2) return;
-  setPan({
-    pointerStartX: event.clientX,
-    pointerStartY: event.clientY,
-    baseViewportX: layout.viewport.x,
-    baseViewportY: layout.viewport.y,
-    startedAt: event.timeStamp,
-  });
-}}
+<section
+  onPointerDown={(event) => {
+    if (event.button !== 2) return;
+    setPan({
+      startX: event.clientX,
+      startY: event.clientY,
+      baseX: layout.viewport.x,
+      baseY: layout.viewport.y,
+      startedAt: Date.now(),
+      nodeId: nodeIdFromEventTarget(event.target),
+      isPanning: false,
+    });
+  }}
+/>
 // After 260ms, derive each viewport from the fixed gesture origin and current pointer.
 // Releasing before the threshold selects the node and opens its menu.
 ```
 
-`pointermove` 不得基于上一次 render 的 `lastX/lastY` 做增量累加，否则连续事件可能复用陈旧状态；应始终使用 `baseViewport + currentPointer - pointerStart`。
+`pointermove` 不得基于上一次 render 的 `lastX/lastY` 做增量累加，否则连续事件可能复用陈旧状态；应始终使用 `gesture.base + currentPointer - gesture.start`。
 
 - [ ] **Step 3: Render the current revision anchors as growth-point tokens in the trunk node**
 
