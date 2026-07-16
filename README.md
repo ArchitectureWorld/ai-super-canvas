@@ -37,6 +37,12 @@ TapNow 类节点生成、素材管理、历史版本和 Workflow 能力，属于
 - Hermes / OpenClaw / Codex 等 Agent 协作
 - 项目知识沉淀、稳定结论与长期记忆
 
+## 当前架构主线
+
+每个画布 Chat 块将演进为一个持久化 `SessionNode/Session`；登录账号默认绑定长期个人 Agent，一个 Workflow 由多个可分枝 Session 组成，每次执行记录为独立 Run。
+
+产品采用“Canvas Agent 控制面 + 可替换 Runtime”架构：Hermes ACP 是第一代候选 Runtime，Letta 是备用候选，二者都必须通过统一契约和隔离测试。权威入口见 [`docs/architecture/README.md`](docs/architecture/README.md)。
+
 ## 当前文档结构
 
 ```text
@@ -49,9 +55,23 @@ TapNow 类节点生成、素材管理、历史版本和 Workflow 能力，属于
 │  ├─ 03-data-model.md
 │  ├─ 04-glossary.md
 │  ├─ 05-ui-direction.md
-│  └─ 06-unified-workspace-model.md
-└─ specs/
-   └─ feature-01-organic-graph-chat.md
+│  ├─ 06-unified-workspace-model.md
+│  ├─ architecture/
+│  │  ├─ README.md
+│  │  ├─ adr/
+│  │  │  └─ 0001-canvas-control-plane-and-runtime-adapters.md
+│  │  ├─ agent-session-domain-model.md
+│  │  ├─ postgres-schema.md
+│  │  ├─ runtime-adapter-contract.md
+│  │  ├─ hermes-acp-capability-gates.md
+│  │  └─ development-roadmap.md
+│  └─ superpowers/
+│     ├─ specs/
+│     └─ plans/
+└─ packages/
+   ├─ core/
+   ├─ ai/
+   └─ db/
 ```
 
 ## 关键词
