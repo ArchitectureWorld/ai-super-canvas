@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import { z, type RefinementCtx } from 'zod';
 
 export const CanvasIdSchema = z.string().uuid();
 
@@ -67,7 +67,7 @@ const CommandBaseSchema = z.object({
   title: z.string().trim().min(1).max(160),
 });
 
-export const ForkMessageSessionCommandSchema = CommandBaseSchema.extend({
+const ForkMessageSessionCommandObjectSchema = CommandBaseSchema.extend({
   kind: z.literal('fork-message'),
   parentSessionId: CanvasIdSchema,
   atMessageId: CanvasIdSchema,
@@ -79,7 +79,7 @@ export const ForkMessageSessionCommandSchema = CommandBaseSchema.extend({
   }),
 });
 
-export const CreateAnchoredSessionCommandSchema = CommandBaseSchema.extend({
+const CreateAnchoredSessionCommandObjectSchema = CommandBaseSchema.extend({
   kind: z.literal('anchor-trunk'),
   agentBindingId: CanvasIdSchema,
   anchor: z.object({
@@ -89,30 +89,46 @@ export const CreateAnchoredSessionCommandSchema = CommandBaseSchema.extend({
   }),
 });
 
+function refineMessageAnchorSource(
+  command: z.infer<typeof ForkMessageSessionCommandObjectSchema>,
+  context: RefinementCtx,
+): void {
+  if (command.anchor.sourceId !== command.atMessageId) {
+    context.addIssue({
+      code: 'custom',
+      message: 'message anchor must reference atMessageId',
+    });
+  }
+}
+
+function refineTrunkAnchorSource(
+  command: z.infer<typeof CreateAnchoredSessionCommandObjectSchema>,
+  context: RefinementCtx,
+): void {
+  if (command.anchor.sourceId !== command.sourceRevisionId) {
+    context.addIssue({
+      code: 'custom',
+      message: 'trunk anchor must reference sourceRevisionId',
+    });
+  }
+}
+
+export const ForkMessageSessionCommandSchema =
+  ForkMessageSessionCommandObjectSchema.superRefine(refineMessageAnchorSource);
+
+export const CreateAnchoredSessionCommandSchema =
+  CreateAnchoredSessionCommandObjectSchema.superRefine(refineTrunkAnchorSource);
+
 export const CreateBranchSessionCommandSchema = z
   .discriminatedUnion('kind', [
-    ForkMessageSessionCommandSchema,
-    CreateAnchoredSessionCommandSchema,
+    ForkMessageSessionCommandObjectSchema,
+    CreateAnchoredSessionCommandObjectSchema,
   ])
   .superRefine((command, context) => {
-    if (
-      command.kind === 'anchor-trunk' &&
-      command.anchor.sourceId !== command.sourceRevisionId
-    ) {
-      context.addIssue({
-        code: 'custom',
-        message: 'trunk anchor must reference sourceRevisionId',
-      });
-    }
-
-    if (
-      command.kind === 'fork-message' &&
-      command.anchor.sourceId !== command.atMessageId
-    ) {
-      context.addIssue({
-        code: 'custom',
-        message: 'message anchor must reference atMessageId',
-      });
+    if (command.kind === 'fork-message') {
+      refineMessageAnchorSource(command, context);
+    } else {
+      refineTrunkAnchorSource(command, context);
     }
   });
 

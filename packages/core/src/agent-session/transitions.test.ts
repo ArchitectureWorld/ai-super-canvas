@@ -2,14 +2,15 @@ import { describe, expect, it } from 'vitest';
 import {
   CreateAnchoredSessionCommandSchema,
   CreateBranchSessionCommandSchema,
+  ForkMessageSessionCommandSchema,
+  GrowthStateSchema,
+  RunStatusSchema,
   assertGrowthTransition,
   assertRunTransition,
 } from './index';
 import type {
   CanvasId,
   CreateAnchoredSessionCommand,
-  GrowthState,
-  RunStatus,
   TextQuoteSelector,
 } from './index';
 
@@ -48,15 +49,7 @@ const validTrunkCommand = {
   },
 } as const;
 
-const runStatuses = [
-  'queued',
-  'running',
-  'waiting_approval',
-  'reconciling',
-  'succeeded',
-  'failed',
-  'cancelled',
-] as const satisfies readonly RunStatus[];
+const runStatuses = RunStatusSchema.options;
 
 const allowedRunTransitions = new Set([
   'queued -> running',
@@ -83,11 +76,7 @@ const runTransitionCases = runStatuses.flatMap((current) =>
   runStatuses.map((next) => ({ current, next })),
 );
 
-const growthStates = [
-  'active',
-  'dormant',
-  'metabolized',
-] as const satisfies readonly GrowthState[];
+const growthStates = GrowthStateSchema.options;
 
 const allowedGrowthTransitions = new Set([
   'active -> dormant',
@@ -245,6 +234,18 @@ describe('agent-session invariants', () => {
     ).toThrowError('message anchor must reference atMessageId');
   });
 
+  it('enforces message source equality through the concrete fork schema', () => {
+    expect(() =>
+      ForkMessageSessionCommandSchema.parse({
+        ...validForkCommand,
+        anchor: {
+          ...validForkCommand.anchor,
+          sourceId: '88888888-8888-4888-8888-888888888888',
+        },
+      }),
+    ).toThrowError('message anchor must reference atMessageId');
+  });
+
   it('requires paired, ordered code-point positions', () => {
     expect(() =>
       CreateBranchSessionCommandSchema.parse({
@@ -308,6 +309,18 @@ describe('agent-session invariants', () => {
   it('requires a trunk anchor to reference its source revision', () => {
     expect(() =>
       CreateBranchSessionCommandSchema.parse({
+        ...validTrunkCommand,
+        anchor: {
+          ...validTrunkCommand.anchor,
+          sourceId: '88888888-8888-4888-8888-888888888888',
+        },
+      }),
+    ).toThrowError('trunk anchor must reference sourceRevisionId');
+  });
+
+  it('enforces revision source equality through the concrete trunk schema', () => {
+    expect(() =>
+      CreateAnchoredSessionCommandSchema.parse({
         ...validTrunkCommand,
         anchor: {
           ...validTrunkCommand.anchor,
