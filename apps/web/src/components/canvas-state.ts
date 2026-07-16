@@ -27,7 +27,7 @@ export function initialCanvasLayout(): CanvasLayoutState {
   return {
     positions: {},
     modelByNodeId: {},
-    selectedNodeId: 'branch-initial',
+    selectedNodeId: 'trunk',
     viewport: { x: 0, y: 0, zoom: 1 },
   };
 }
@@ -37,6 +37,13 @@ export function composerTargetLabel(target: ComposerTarget): string {
   if (target.kind === 'anchor') return `锚点：“${target.title}”`;
   if (target.kind === 'outcome') return '完善成果';
   return `分支：${target.title}`;
+}
+
+export function isBranchComposerSubmitDisabled(
+  lifecycle: 'active' | 'dormant' | 'metabolized',
+  message: string,
+): boolean {
+  return lifecycle !== 'active' || !message.trim();
 }
 
 export function moveCanvasNode(

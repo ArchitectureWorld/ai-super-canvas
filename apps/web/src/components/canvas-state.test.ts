@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   composerTargetLabel,
   initialCanvasLayout,
+  isBranchComposerSubmitDisabled,
   moveCanvasNode,
   panCanvas,
   setCanvasNodeModel,
@@ -9,6 +10,14 @@ import {
 } from './canvas-state';
 
 describe('canvas interaction state', () => {
+  it('selects the trunk by default instead of exposing a branch Composer', () => {
+    expect(initialCanvasLayout().selectedNodeId).toBe('trunk');
+  });
+
+  it('disables Composer submission for a dormant branch with a residual draft', () => {
+    expect(isBranchComposerSubmitDisabled('dormant', '尚未发送的内容')).toBe(true);
+  });
+
   it('keeps a branch selection explicit in the Composer target', () => {
     expect(composerTargetLabel({ kind: 'branch', title: '回流策略' })).toBe('分支：回流策略');
     expect(composerTargetLabel({ kind: 'trunk', title: '主干活文档' })).toBe('主干');
