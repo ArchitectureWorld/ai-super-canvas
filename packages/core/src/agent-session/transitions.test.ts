@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CreateAnchoredSessionCommandSchema,
   CreateBranchSessionCommandSchema,
   assertGrowthTransition,
   assertRunTransition,
+} from './index';
+import type {
+  CanvasId,
+  CreateAnchoredSessionCommand,
+  GrowthState,
+  RunStatus,
+  TextQuoteSelector,
 } from './index';
 
 const validForkCommand = {
@@ -40,26 +48,96 @@ const validTrunkCommand = {
   },
 } as const;
 
-describe('agent-session invariants', () => {
-  it('accepts valid run transitions and rejects terminal resurrection', () => {
-    expect(() => assertRunTransition('queued', 'running')).not.toThrow();
-    expect(() => assertRunTransition('running', 'waiting_approval')).not.toThrow();
-    expect(() => assertRunTransition('waiting_approval', 'running')).not.toThrow();
-    expect(() => assertRunTransition('running', 'reconciling')).not.toThrow();
-    expect(() => assertRunTransition('reconciling', 'failed')).not.toThrow();
-    expect(() => assertRunTransition('running', 'succeeded')).not.toThrow();
-    expect(() => assertRunTransition('cancelled', 'succeeded')).toThrowError(
-      'Invalid run transition: cancelled -> succeeded',
-    );
-  });
+const runStatuses = [
+  'queued',
+  'running',
+  'waiting_approval',
+  'reconciling',
+  'succeeded',
+  'failed',
+  'cancelled',
+] as const satisfies readonly RunStatus[];
 
-  it('allows active and dormant growth while keeping metabolized terminal', () => {
-    expect(() => assertGrowthTransition('active', 'dormant')).not.toThrow();
-    expect(() => assertGrowthTransition('dormant', 'active')).not.toThrow();
-    expect(() => assertGrowthTransition('active', 'metabolized')).not.toThrow();
-    expect(() => assertGrowthTransition('metabolized', 'active')).toThrowError(
-      'Invalid growth transition: metabolized -> active',
-    );
+const allowedRunTransitions = new Set([
+  'queued -> running',
+  'queued -> reconciling',
+  'queued -> failed',
+  'queued -> cancelled',
+  'running -> waiting_approval',
+  'running -> reconciling',
+  'running -> succeeded',
+  'running -> failed',
+  'running -> cancelled',
+  'waiting_approval -> running',
+  'waiting_approval -> reconciling',
+  'waiting_approval -> failed',
+  'waiting_approval -> cancelled',
+  'reconciling -> running',
+  'reconciling -> waiting_approval',
+  'reconciling -> succeeded',
+  'reconciling -> failed',
+  'reconciling -> cancelled',
+]);
+
+const runTransitionCases = runStatuses.flatMap((current) =>
+  runStatuses.map((next) => ({ current, next })),
+);
+
+const growthStates = [
+  'active',
+  'dormant',
+  'metabolized',
+] as const satisfies readonly GrowthState[];
+
+const allowedGrowthTransitions = new Set([
+  'active -> dormant',
+  'active -> metabolized',
+  'dormant -> active',
+  'dormant -> metabolized',
+]);
+
+const growthTransitionCases = growthStates.flatMap((current) =>
+  growthStates.map((next) => ({ current, next })),
+);
+
+describe('agent-session invariants', () => {
+  it.each(runTransitionCases)(
+    'enforces the exact run transition $current -> $next',
+    ({ current, next }) => {
+      const transition = `${current} -> ${next}`;
+      const assertion = () => assertRunTransition(current, next);
+
+      if (allowedRunTransitions.has(transition)) {
+        expect(assertion).not.toThrow();
+      } else {
+        expect(assertion).toThrowError(`Invalid run transition: ${transition}`);
+      }
+    },
+  );
+
+  it.each(growthTransitionCases)(
+    'enforces the exact growth transition $current -> $next',
+    ({ current, next }) => {
+      const transition = `${current} -> ${next}`;
+      const assertion = () => assertGrowthTransition(current, next);
+
+      if (allowedGrowthTransitions.has(transition)) {
+        expect(assertion).not.toThrow();
+      } else {
+        expect(assertion).toThrowError(`Invalid growth transition: ${transition}`);
+      }
+    },
+  );
+
+  it('exports public types inferred from the command schemas', () => {
+    const canvasId: CanvasId = validTrunkCommand.commandId;
+    const selector: TextQuoteSelector = validTrunkCommand.anchor.selector;
+    const command: CreateAnchoredSessionCommand =
+      CreateAnchoredSessionCommandSchema.parse(validTrunkCommand);
+
+    expect(canvasId).toBe(validTrunkCommand.commandId);
+    expect(selector.kind).toBe('text-quote');
+    expect(command.kind).toBe('anchor-trunk');
   });
 
   it('requires UUIDs for every message-fork identifier', () => {
@@ -85,6 +163,34 @@ describe('agent-session invariants', () => {
         anchor: { ...validForkCommand.anchor, sourceId: 'not-a-uuid' },
       }),
     ).toThrow();
+  });
+
+  it('requires UUIDs for every trunk-anchor identifier', () => {
+    for (const field of [
+      'commandId',
+      'workflowId',
+      'agentBindingId',
+    ] as const) {
+      expect(() =>
+        CreateBranchSessionCommandSchema.parse({
+          ...validTrunkCommand,
+          [field]: 'not-a-uuid',
+        }),
+      ).toThrow();
+    }
+
+    const invalidSourceIds = CreateBranchSessionCommandSchema.safeParse({
+      ...validTrunkCommand,
+      sourceRevisionId: 'not-a-uuid',
+      anchor: { ...validTrunkCommand.anchor, sourceId: 'not-a-uuid' },
+    });
+
+    expect(invalidSourceIds.success).toBe(false);
+    if (!invalidSourceIds.success) {
+      expect(invalidSourceIds.error.issues.map((issue) => issue.path.join('.'))).toEqual(
+        expect.arrayContaining(['sourceRevisionId', 'anchor.sourceId']),
+      );
+    }
   });
 
   it('requires the parent, message, revision and title for a message fork', () => {

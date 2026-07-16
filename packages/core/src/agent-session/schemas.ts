@@ -116,13 +116,18 @@ export const CreateBranchSessionCommandSchema = z
     }
   });
 
-export type GrowthState = z.infer<typeof GrowthStateSchema>;
+export type CanvasId = z.infer<typeof CanvasIdSchema>;
 export type ActorContext = z.infer<typeof ActorContextSchema>;
+export type GrowthState = z.infer<typeof GrowthStateSchema>;
 export type SessionStatus = z.infer<typeof SessionStatusSchema>;
 export type RunStatus = z.infer<typeof RunStatusSchema>;
+export type TextQuoteSelector = z.infer<typeof TextQuoteSelectorSchema>;
 export type CreateBranchSessionCommand = z.infer<
   typeof CreateBranchSessionCommandSchema
 >;
 export type ForkMessageSessionCommand = z.infer<
   typeof ForkMessageSessionCommandSchema
+>;
+export type CreateAnchoredSessionCommand = z.infer<
+  typeof CreateAnchoredSessionCommandSchema
 >;
