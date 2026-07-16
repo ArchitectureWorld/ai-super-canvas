@@ -454,6 +454,10 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
                 <>
                   <p className="inspector-source">来源生长锚点：{workspace.anchors.find((item) => item.id === selectedBranch.anchorId)?.selector.exact ?? '不可用'}</p>
                   <div className="inspector-messages">{selectedMessages.map((message) => <p key={message.id}><b>{message.author === 'user' ? '你' : message.author === 'demo-ai' ? 'AI' : '系统'}</b>{message.content}</p>)}</div>
+                  <form className="node-composer" onSubmit={(event) => { event.preventDefault(); submitMessage(); }}>
+                    <div className="composer-chips"><span>{composerTargetLabel(composerTarget)}</span><span>{selectedMessages.length} 条消息</span></div>
+                    <div className="composer-row"><button type="button" className="composer-add" aria-label="添加上下文">＋</button><input aria-label="AI Composer" value={branchMessage} disabled={selectedBranch.lifecycle !== 'active'} placeholder={selectedBranch.lifecycle === 'dormant' ? '先恢复分支再继续探索' : '让这个分支继续生长…'} onChange={(event) => setBranchMessage(event.target.value)} /><button className="composer-send" type="submit" disabled={!branchMessage.trim()}>↑</button></div>
+                  </form>
                   <div className="inspector-actions"><button type="button" onClick={createOutcome} disabled={selectedBranch.lifecycle !== 'active'}>提炼成果</button>{selectedBranch.lifecycle === 'active' ? <button type="button" onClick={() => changeLifecycle('dormant')}>设为休眠</button> : null}{selectedBranch.lifecycle === 'dormant' ? <button type="button" onClick={() => changeLifecycle('active')}>恢复生长</button> : null}{selectedBranch.lifecycle !== 'metabolized' ? <button type="button" onClick={() => changeLifecycle('metabolized')}>代谢为经验</button> : null}</div>
                 </>
               ) : null}
@@ -462,11 +466,6 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
             </aside>
           ) : null}
         </div>
-
-        <form className="canvas-composer" onSubmit={(event) => { event.preventDefault(); submitMessage(); }}>
-          <div className="composer-chips"><span>{composerTargetLabel(composerTarget)}</span><span>{selectedBranch ? `${selectedMessages.length} 条消息` : '选择主干文字以创建分支'}</span></div>
-          <div className="composer-row"><button type="button" className="composer-add" aria-label="添加上下文">＋</button><input aria-label="AI Composer" value={branchMessage} disabled={!selectedBranch || selectedBranch.lifecycle !== 'active'} placeholder={selectedBranch?.lifecycle === 'dormant' ? '先恢复分支再继续探索' : selectedBranch ? '让这个分支继续生长…' : '请选择一个活跃分支'} onChange={(event) => setBranchMessage(event.target.value)} /><button className="composer-send" type="submit" disabled={!selectedBranch || !branchMessage.trim()}>↑</button></div>
-        </form>
 
         <div className="zoom-controls"><button type="button" onClick={() => setLayout((state) => zoomCanvas(state, -1))}>−</button><span>{Math.round(layout.viewport.zoom * 100)}%</span><button type="button" onClick={() => setLayout((state) => zoomCanvas(state, 1))}>＋</button><button type="button" onClick={() => setLayout(initialCanvasLayout())}>⌗</button></div>
       </section>

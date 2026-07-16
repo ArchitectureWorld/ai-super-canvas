@@ -23,3 +23,30 @@ test('runs the structured growth golden path in a browser', async ({ page }) => 
   await page.reload();
   await expect(page.getByLabel('主干活文档')).toHaveValue(/## 关于/);
 });
+
+test('shows the composer only inside the selected branch panel', async ({ page }) => {
+  await page.goto('/');
+
+  const trunk = page.getByRole('textbox', { name: '主干活文档' });
+  await expect(trunk).toBeVisible();
+  await expect(page.locator('.canvas-composer')).toHaveCount(0);
+  await expect(page.getByLabel('AI Composer')).toHaveCount(0);
+
+  await trunk.click();
+  await expect(page.getByLabel('节点设置')).toContainText('主干活文档');
+  await expect(page.getByLabel('AI Composer')).toHaveCount(0);
+
+  await page.keyboard.press('Control+A');
+  await page.getByRole('button', { name: '＋ 长出分支' }).click();
+
+  const branchPanel = page.getByLabel('节点设置');
+  const composer = branchPanel.getByLabel('AI Composer');
+  await expect(composer).toBeVisible();
+  await composer.fill('面板内输入不会遮挡画布。');
+  await composer.press('Enter');
+  await expect(branchPanel.getByText('面板内输入不会遮挡画布。', { exact: true })).toBeVisible();
+
+  await branchPanel.getByRole('button', { name: '提炼成果' }).click();
+  await expect(page.getByLabel('节点设置')).toContainText('关于');
+  await expect(page.getByLabel('AI Composer')).toHaveCount(0);
+});
