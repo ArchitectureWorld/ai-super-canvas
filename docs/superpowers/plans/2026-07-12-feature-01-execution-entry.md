@@ -1,6 +1,8 @@
 # Feature 01 执行入口与强制修正
 
-> 本文件是 Feature 01 的**唯一执行入口**。当设计规格、详细实施计划和 Review 记录存在冲突时，以本文件的约束为准。
+> 状态：**Superseded for Agent/Session implementation**。本文不再是当前唯一执行入口；植物语义和早期 Feature 01 风险仍可参考。Agent-Session 当前入口见 [`2026-07-15-agent-session-control-plane-foundation.md`](./2026-07-15-agent-session-control-plane-foundation.md)。
+
+> 历史说明：本文曾是 2026-07-12 Feature 01 的唯一执行入口；该权威声明仅适用于当时范围。
 
 ## 1. 执行文档顺序
 

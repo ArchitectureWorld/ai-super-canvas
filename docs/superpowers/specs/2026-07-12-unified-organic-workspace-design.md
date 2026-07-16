@@ -1,7 +1,9 @@
 # AI 超级画板统一有机工作台设计规格
 
+> 状态：历史综合设计。产品原则和植物语义可复用；Agent、Session、Run、Runtime、Artifact/Proposal 与画布投影的权威边界见 [`docs/architecture`](../../architecture/README.md)。
+
 - 日期：2026-07-12
-- 状态：稳定设计，进入实施规划
+- 当前状态：Historical；原状态为“稳定设计，进入实施规划”
 - 范围：Feature 01——图谱式 / 有机式会话画布的可实施 MVP
 
 ## 1. 目标

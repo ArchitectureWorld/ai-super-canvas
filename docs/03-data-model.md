@@ -1,5 +1,7 @@
 # 初始数据模型草案
 
+> 文档状态：**Superseded / 历史草案**。旧 `Conversation + Node + Branch + Card` 模型存在重复身份，禁止用于新实现。权威模型见 [`agent-session-domain-model.md`](./architecture/agent-session-domain-model.md) 和 [`postgres-schema.md`](./architecture/postgres-schema.md)。
+
 ## 1. 建模目标
 
 本数据模型用于描述 **图谱式 / 有机式会话画布** 的第一版核心对象。

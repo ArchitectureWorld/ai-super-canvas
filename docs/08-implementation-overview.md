@@ -1,6 +1,8 @@
 # Feature 01 可落地实施方案总览
 
-## 1. 最终方案
+> 文档状态：2026-07-12 Feature 01 历史实施总览，不再是 Agent-Session 架构的“最终方案”或最高优先级入口。当前权威入口见 [`docs/architecture/README.md`](./architecture/README.md)。
+
+## 1. 2026-07-12 历史方案
 
 Feature 01 采用以下技术路线：
 
@@ -44,16 +46,16 @@ Vitest + PostgreSQL Integration Tests + Playwright
 9. 操作历史、生长时间线、AI 历史和版本历史分开处理。
 10. 删除优先通过代谢语义，而不是无痕硬删除。
 
-## 3. 文档入口
+## 3. 历史文档入口
 
-按以下顺序阅读：
+复盘 2026-07-12 方案时按以下顺序阅读：
 
 1. 设计规格：`docs/superpowers/specs/2026-07-12-unified-organic-workspace-design.md`
 2. 多轮 Review：`docs/reviews/2026-07-12-feature-01-implementation-review.md`
 3. 详细实施计划：`docs/superpowers/plans/2026-07-12-feature-01-mvp-implementation.md`
-4. 最终执行入口：`docs/superpowers/plans/2026-07-12-feature-01-execution-entry.md`
+4. 当时的最终执行入口：`docs/superpowers/plans/2026-07-12-feature-01-execution-entry.md`
 
-其中第 4 项是执行优先级最高的约束文件。
+其中第 4 项只在当时 Feature 01 范围内具有最高执行优先级，不覆盖当前 Agent-Session 架构。
 
 ## 4. 实施阶段
 

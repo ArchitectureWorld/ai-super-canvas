@@ -1,5 +1,7 @@
 # Feature 01 Organic Graph Workspace Implementation Plan
 
+> 状态：2026-07-12 历史详细计划。通用 `WorkspaceObject`、AI Run/Proposal 混合状态和 Agent 后置假设已被 [`docs/architecture`](../../architecture/README.md) 取代；未完成任务不得直接照此执行。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a private-alpha MVP where a user can create a trunk conversation, select a word/sentence/paragraph as a semantic anchor, grow an independent branch, turn branch output into a conclusion card, preview and apply feedback to the trunk, metabolize the branch, and inspect the complete growth timeline.

@@ -1,5 +1,7 @@
 # 术语表
 
+> 文档状态：产品语言参考。涉及 Account、Agent、Workflow、Session、Run、Artifact、Proposal，以及 Branch/落叶精确生命周期时，以 [`agent-session-domain-model.md`](./architecture/agent-session-domain-model.md) 为准。
+
 ## AI 超级画板
 
 面向 AI 原生工作流的图谱式 / 有机式智能画布。
