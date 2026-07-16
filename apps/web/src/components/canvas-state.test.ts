@@ -7,6 +7,7 @@ import {
   moveCanvasNode,
   normalizeWheelZoomDelta,
   panCanvas,
+  pruneCanvasNodeModels,
   resolveCanvasNodeModel,
   setCanvasNodeModel,
   zoomCanvas,
@@ -17,9 +18,17 @@ describe('canvas interaction state', () => {
     expect(initialCanvasLayout().selectedNodeId).toBe('trunk');
   });
 
-  it('disables Composer submission for a dormant branch with a residual draft', () => {
-    expect(isBranchComposerSubmitDisabled('dormant', '尚未发送的内容')).toBe(true);
-  });
+  it.each([
+    { lifecycle: 'active' as const, message: '继续生长', disabled: false },
+    { lifecycle: 'active' as const, message: '   ', disabled: true },
+    { lifecycle: 'dormant' as const, message: '继续生长', disabled: true },
+    { lifecycle: 'metabolized' as const, message: '继续生长', disabled: true },
+  ])(
+    'returns $disabled for a $lifecycle branch with message "$message"',
+    ({ lifecycle, message, disabled }) => {
+      expect(isBranchComposerSubmitDisabled(lifecycle, message)).toBe(disabled);
+    },
+  );
 
   it('keeps a branch selection explicit in the Composer target', () => {
     expect(composerTargetLabel({ kind: 'branch', title: '回流策略' })).toBe('分支：回流策略');
@@ -153,5 +162,30 @@ describe('canvas interaction state', () => {
 
     expect(resolveCanvasNodeModel('qwen-max', catalog)).toBe('qwen-max');
     expect(resolveCanvasNodeModel('retired-model', catalog)).toBe('deepseek-chat');
+  });
+
+  it('removes stored node models that are no longer in the runtime catalog', () => {
+    const initial = {
+      ...initialCanvasLayout(),
+      modelByNodeId: {
+        trunk: 'deepseek-chat',
+        'branch-1': 'retired-model',
+      },
+    };
+
+    expect(pruneCanvasNodeModels(initial, { models: ['deepseek-chat', 'qwen-max'] }))
+      .toEqual({
+        ...initial,
+        modelByNodeId: { trunk: 'deepseek-chat' },
+      });
+  });
+
+  it('preserves the state reference when every stored node model remains available', () => {
+    const initial = {
+      ...initialCanvasLayout(),
+      modelByNodeId: { trunk: 'deepseek-chat' },
+    };
+
+    expect(pruneCanvasNodeModels(initial, { models: ['deepseek-chat'] })).toBe(initial);
   });
 });

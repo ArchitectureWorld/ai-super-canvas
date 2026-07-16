@@ -22,6 +22,7 @@ import {
   isBranchComposerSubmitDisabled,
   moveCanvasNode,
   panCanvas,
+  pruneCanvasNodeModels,
   resolveCanvasNodeModel,
   setCanvasNodeModel,
   zoomCanvas,
@@ -145,6 +146,20 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
   const canvasRef = useRef<HTMLDivElement>(null);
   const draft = draftOverride ?? currentTrunkContent(workspace);
   const projection = useMemo(() => projectGrowth(workspace), [workspace]);
+  const availableModelsKey = JSON.stringify(modelCatalog.models);
+
+  useEffect(() => {
+    const models = JSON.parse(availableModelsKey) as string[];
+    let isCurrentCatalog = true;
+    queueMicrotask(() => {
+      if (isCurrentCatalog) {
+        setLayout((state) => pruneCanvasNodeModels(state, { models }));
+      }
+    });
+    return () => {
+      isCurrentCatalog = false;
+    };
+  }, [availableModelsKey]);
 
   useEffect(() => {
     window.localStorage.setItem(layoutStorageKey, JSON.stringify(layout));

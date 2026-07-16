@@ -1,5 +1,14 @@
 import { expect, test } from '@playwright/test';
 
+const expectedModelsEnvironment = process.env.E2E_EXPECTED_MODELS;
+const expectedModels = expectedModelsEnvironment === undefined
+  ? undefined
+  : expectedModelsEnvironment.split(',').map((model) => model.trim()).filter(Boolean);
+const expectedDefaultModelEnvironment = process.env.E2E_EXPECTED_DEFAULT_MODEL;
+const expectedDefaultModel = expectedDefaultModelEnvironment === undefined
+  ? undefined
+  : expectedDefaultModelEnvironment.trim();
+
 test('runs the structured growth golden path in a browser', async ({ page }) => {
   await page.goto('/');
 
@@ -19,8 +28,16 @@ test('runs the structured growth golden path in a browser', async ({ page }) => 
     options.map((option) => (option as HTMLOptionElement).value)
   ));
   const currentModel = await trunkModel.inputValue();
-  expect(modelOptions.length).toBeGreaterThan(0);
-  expect(modelOptions).toContain(currentModel);
+  if (expectedModels === undefined) {
+    expect(modelOptions.length).toBeGreaterThan(0);
+  } else {
+    expect(modelOptions).toEqual(expectedModels);
+  }
+  if (expectedDefaultModel === undefined) {
+    expect(modelOptions).toContain(currentModel);
+  } else {
+    expect(currentModel).toBe(expectedDefaultModel);
+  }
   const alternativeModel = modelOptions.find((model) => model !== currentModel);
   if (alternativeModel) {
     await trunkModel.selectOption(alternativeModel);

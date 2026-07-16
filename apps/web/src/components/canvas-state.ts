@@ -1,3 +1,5 @@
+import type { BranchLifecycle } from '@ai-super-canvas/core';
+
 export interface CanvasPosition {
   x: number;
   y: number;
@@ -60,7 +62,7 @@ export function composerTargetLabel(target: ComposerTarget): string {
 }
 
 export function isBranchComposerSubmitDisabled(
-  lifecycle: 'active' | 'dormant' | 'metabolized',
+  lifecycle: BranchLifecycle,
   message: string,
 ): boolean {
   return lifecycle !== 'active' || !message.trim();
@@ -147,6 +149,21 @@ export function resolveCanvasNodeModel(
   return savedModel && catalog.models.includes(savedModel)
     ? savedModel
     : catalog.defaultModel;
+}
+
+export function pruneCanvasNodeModels(
+  state: CanvasLayoutState,
+  catalog: { models: readonly string[] },
+): CanvasLayoutState {
+  const availableModels = new Set(catalog.models);
+  const modelEntries = Object.entries(state.modelByNodeId);
+  const availableEntries = modelEntries.filter(([, model]) => availableModels.has(model));
+  if (availableEntries.length === modelEntries.length) return state;
+
+  return {
+    ...state,
+    modelByNodeId: Object.fromEntries(availableEntries),
+  };
 }
 
 export function setCanvasNodeModel(
