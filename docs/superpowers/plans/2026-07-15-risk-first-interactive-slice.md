@@ -23,7 +23,7 @@
 - [ ] 修正 Playwright 用例目录与生产端口配置。
 - [ ] 执行 `pnpm lint`、`pnpm typecheck`、`pnpm test`、`pnpm build` 和 `pnpm test:e2e`。
 - [ ] 以 Docker Compose + `systemd --user` 在 `127.0.0.1:3000` 运行；不对 LAN 暴露。
-- [ ] 更新 `/home/youran/data/service-ports.md` 和 `service-ports.json`，再用 HTTP、容器健康状态与浏览器三重验证。
+- [ ] 更新 `$HOME/data/service-ports.md` 和 `$HOME/data/service-ports.json`，再用 HTTP、容器健康状态与浏览器三重验证。
 
 ## 审查点
 
