@@ -17,10 +17,10 @@ import {
 import type { ModelCatalog } from '@ai-super-canvas/ai';
 import {
   composerTargetLabel,
+  createCanvasWheelZoomIntent,
   initialCanvasLayout,
   isBranchComposerSubmitDisabled,
   moveCanvasNode,
-  normalizeWheelZoomDelta,
   panCanvas,
   resolveCanvasNodeModel,
   setCanvasNodeModel,
@@ -29,7 +29,6 @@ import {
 } from './canvas-state';
 import {
   type PointerEvent as ReactPointerEvent,
-  type WheelEvent,
   useEffect,
   useMemo,
   useRef,
@@ -150,6 +149,32 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
   useEffect(() => {
     window.localStorage.setItem(layoutStorageKey, JSON.stringify(layout));
   }, [layout]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const listenerOptions: AddEventListenerOptions = { passive: false };
+    const handleCanvasWheel = (event: WheelEvent): void => {
+      if (event.target instanceof Element && event.target.closest('.node-popover')) return;
+      const stageRect = canvas.getBoundingClientRect();
+      const intent = createCanvasWheelZoomIntent({
+        deltaY: event.deltaY,
+        deltaMode: event.deltaMode,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        stageRectLeft: stageRect.left,
+        stageRectTop: stageRect.top,
+        stageClientLeft: canvas.clientLeft,
+        stageClientTop: canvas.clientTop,
+      });
+      if (!intent) return;
+      event.preventDefault();
+      setLayout((state) => zoomCanvas(state, intent.delta, intent.focalPoint));
+    };
+
+    canvas.addEventListener('wheel', handleCanvasWheel, listenerOptions);
+    return () => canvas.removeEventListener('wheel', handleCanvasWheel, listenerOptions);
+  }, []);
 
   const nodes = projection.nodes.map((node) => {
     const override = layout.positions[node.id];
@@ -317,18 +342,6 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
     setPan(null);
   }
 
-  function handleCanvasWheel(event: WheelEvent<HTMLDivElement>): void {
-    event.preventDefault();
-    const zoomDelta = normalizeWheelZoomDelta(event.deltaY, event.deltaMode);
-    if (zoomDelta === 0) return;
-    const stageRect = event.currentTarget.getBoundingClientRect();
-    const focalPoint = {
-      x: event.clientX - stageRect.left - event.currentTarget.clientLeft,
-      y: event.clientY - stageRect.top - event.currentTarget.clientTop,
-    };
-    setLayout((state) => zoomCanvas(state, zoomDelta, focalPoint));
-  }
-
   return (
     <main className="growth-workspace">
       <header className="canvas-topbar">
@@ -366,7 +379,6 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
         onPointerUp={finishCanvasPointer}
         onPointerLeave={() => { setDrag(null); setPan(null); }}
         onContextMenu={(event) => event.preventDefault()}
-        onWheel={handleCanvasWheel}
       >
         <aside className="canvas-rail" aria-label="画布工具">
           <button className="active" type="button" aria-label="选择工具">↖</button>

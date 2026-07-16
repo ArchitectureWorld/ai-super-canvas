@@ -23,6 +23,22 @@ export interface ComposerTarget {
   title: string;
 }
 
+export interface CanvasWheelZoomIntentInput {
+  deltaY: number;
+  deltaMode: number;
+  clientX: number;
+  clientY: number;
+  stageRectLeft: number;
+  stageRectTop: number;
+  stageClientLeft: number;
+  stageClientTop: number;
+}
+
+export interface CanvasWheelZoomIntent {
+  delta: number;
+  focalPoint: Pick<CanvasPosition, 'x' | 'y'>;
+}
+
 const wheelPixelsPerLine = 16;
 const wheelPixelsPerPage = 800;
 const wheelPixelsPerZoomStep = 100;
@@ -73,6 +89,20 @@ export function normalizeWheelZoomDelta(deltaY: number, deltaMode: number): numb
       : 1;
   const zoomDelta = -(deltaY * pixelsPerUnit) / wheelPixelsPerZoomStep;
   return Math.max(-1, Math.min(1, zoomDelta));
+}
+
+export function createCanvasWheelZoomIntent(
+  input: CanvasWheelZoomIntentInput,
+): CanvasWheelZoomIntent | null {
+  const delta = normalizeWheelZoomDelta(input.deltaY, input.deltaMode);
+  if (delta === 0) return null;
+  return {
+    delta,
+    focalPoint: {
+      x: input.clientX - input.stageRectLeft - input.stageClientLeft,
+      y: input.clientY - input.stageRectTop - input.stageClientTop,
+    },
+  };
 }
 
 export function zoomCanvas(

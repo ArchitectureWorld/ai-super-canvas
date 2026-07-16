@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   composerTargetLabel,
+  createCanvasWheelZoomIntent,
   initialCanvasLayout,
   isBranchComposerSubmitDisabled,
   moveCanvasNode,
@@ -54,6 +55,35 @@ describe('canvas interaction state', () => {
   it('clamps page wheel deltas to one zoom step per event', () => {
     expect(normalizeWheelZoomDelta(-1, 2)).toBe(1);
     expect(normalizeWheelZoomDelta(1, 2)).toBe(-1);
+  });
+
+  it('creates no canvas zoom intent without vertical movement', () => {
+    expect(createCanvasWheelZoomIntent({
+      deltaY: 0,
+      deltaMode: 0,
+      clientX: 461,
+      clientY: 309,
+      stageRectLeft: 120,
+      stageRectTop: 70,
+      stageClientLeft: 2,
+      stageClientTop: 3,
+    })).toBeNull();
+  });
+
+  it('maps a wheel focal point to the bordered stage content coordinates', () => {
+    expect(createCanvasWheelZoomIntent({
+      deltaY: -25,
+      deltaMode: 0,
+      clientX: 461,
+      clientY: 309,
+      stageRectLeft: 120,
+      stageRectTop: 70,
+      stageClientLeft: 2,
+      stageClientTop: 3,
+    })).toEqual({
+      delta: 0.25,
+      focalPoint: { x: 339, y: 236 },
+    });
   });
 
   it('keeps the focal world point fixed while zooming a translated canvas', () => {
