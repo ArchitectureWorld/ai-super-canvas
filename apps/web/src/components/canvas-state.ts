@@ -6,8 +6,16 @@ export interface CanvasPosition {
 
 export interface CanvasLayoutState {
   positions: Record<string, CanvasPosition>;
+  modelByNodeId: Record<string, string>;
   selectedNodeId: string | null;
   viewport: { x: number; y: number; zoom: number };
+}
+
+export interface CanvasPanGesture {
+  startX: number;
+  startY: number;
+  baseX: number;
+  baseY: number;
 }
 
 export interface ComposerTarget {
@@ -18,6 +26,7 @@ export interface ComposerTarget {
 export function initialCanvasLayout(): CanvasLayoutState {
   return {
     positions: {},
+    modelByNodeId: {},
     selectedNodeId: 'branch-initial',
     viewport: { x: 0, y: 0, zoom: 1 },
   };
@@ -47,4 +56,33 @@ export function moveCanvasNode(
 export function zoomCanvas(state: CanvasLayoutState, delta: number): CanvasLayoutState {
   const zoom = Math.max(0.55, Math.min(1.45, state.viewport.zoom + delta * 0.1));
   return { ...state, viewport: { ...state.viewport, zoom } };
+}
+
+export function panCanvas(
+  state: CanvasLayoutState,
+  gesture: CanvasPanGesture,
+  pointer: Pick<CanvasPosition, 'x' | 'y'>,
+): CanvasLayoutState {
+  return {
+    ...state,
+    viewport: {
+      ...state.viewport,
+      x: gesture.baseX + pointer.x - gesture.startX,
+      y: gesture.baseY + pointer.y - gesture.startY,
+    },
+  };
+}
+
+export function setCanvasNodeModel(
+  state: CanvasLayoutState,
+  nodeId: string,
+  model: string,
+): CanvasLayoutState {
+  return {
+    ...state,
+    modelByNodeId: {
+      ...state.modelByNodeId,
+      [nodeId]: model,
+    },
+  };
 }

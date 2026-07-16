@@ -131,8 +131,10 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
   const [previewCardId, setPreviewCardId] = useState<string | null>(null);
   const [drag, setDrag] = useState<{ nodeId: string; startX: number; startY: number; baseX: number; baseY: number } | null>(null);
   const [pan, setPan] = useState<{
-    lastX: number;
-    lastY: number;
+    startX: number;
+    startY: number;
+    baseX: number;
+    baseY: number;
     startedAt: number;
     nodeId: string | null;
     isPanning: boolean;
@@ -296,14 +298,9 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
     }
     if (pan) {
       if (!pan.isPanning && Date.now() - pan.startedAt < 260) return;
-      setLayout((state) => panCanvas(state, {
-        x: event.clientX - pan.lastX,
-        y: event.clientY - pan.lastY,
-      }));
+      setLayout((state) => panCanvas(state, pan, { x: event.clientX, y: event.clientY }));
       setPan((current) => current ? {
         ...current,
-        lastX: event.clientX,
-        lastY: event.clientY,
         isPanning: true,
       } : null);
     }
@@ -346,8 +343,10 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
           if (event.button !== 2) return;
           event.currentTarget.setPointerCapture(event.pointerId);
           setPan({
-            lastX: event.clientX,
-            lastY: event.clientY,
+            startX: event.clientX,
+            startY: event.clientY,
+            baseX: layout.viewport.x,
+            baseY: layout.viewport.y,
             startedAt: Date.now(),
             nodeId: nodeIdFromEventTarget(event.target),
             isPanning: false,
