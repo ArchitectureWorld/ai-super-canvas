@@ -2,6 +2,7 @@ export const CORE_PACKAGE_NAME = '@ai-super-canvas/core' as const;
 
 export type RuntimeTarget = 'browser' | 'server';
 
+export * from './agent-session';
 export { codePointOffset } from './text-position';
 export { projectGrowth } from './growth-projection';
 export type {
