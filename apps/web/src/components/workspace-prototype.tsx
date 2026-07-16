@@ -197,7 +197,7 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
   });
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const selectedNode = layout.selectedNodeId ? nodeById.get(layout.selectedNodeId) : undefined;
-  const selectedBranch = selectedNode?.branchId
+  const selectedBranch = selectedNode?.kind === 'branch' && selectedNode.branchId
     ? workspace.branches.find((branch) => branch.id === selectedNode.branchId)
     : undefined;
   const selectedCard = selectedNode?.cardId

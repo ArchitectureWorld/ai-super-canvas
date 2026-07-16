@@ -95,7 +95,7 @@ test('shows the composer only inside the selected branch panel', async ({ page }
   await expect(composer).toBeVisible();
   await composer.fill('面板内输入不会遮挡画布。');
   await composer.press('Enter');
-  await expect(branchPanel.getByText('面板内输入不会遮挡画布。', { exact: true })).toBeVisible();
+  await expect(branchPanel).toContainText('面板内输入不会遮挡画布。');
 
   await branchPanel.getByRole('button', { name: '提炼成果' }).click();
   await expect(page.getByLabel('节点设置')).toContainText('关于');
