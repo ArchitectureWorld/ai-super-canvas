@@ -110,6 +110,15 @@ export function panCanvas(
   };
 }
 
+export function resolveCanvasNodeModel(
+  savedModel: string | undefined,
+  catalog: { models: readonly string[]; defaultModel: string },
+): string {
+  return savedModel && catalog.models.includes(savedModel)
+    ? savedModel
+    : catalog.defaultModel;
+}
+
 export function setCanvasNodeModel(
   state: CanvasLayoutState,
   nodeId: string,

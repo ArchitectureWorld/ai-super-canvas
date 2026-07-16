@@ -18,6 +18,8 @@ services:
       APP_OWNER_ID: ${APP_OWNER_ID:-local-owner}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
+      AI_AVAILABLE_MODELS: ${AI_AVAILABLE_MODELS:-}
+      AI_DEFAULT_MODEL: ${AI_DEFAULT_MODEL:-}
     ports:
       - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-3000}:3000"
     healthcheck:

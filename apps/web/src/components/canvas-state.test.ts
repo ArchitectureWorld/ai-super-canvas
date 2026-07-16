@@ -6,6 +6,7 @@ import {
   moveCanvasNode,
   normalizeWheelZoomDelta,
   panCanvas,
+  resolveCanvasNodeModel,
   setCanvasNodeModel,
   zoomCanvas,
 } from './canvas-state';
@@ -112,5 +113,15 @@ describe('canvas interaction state', () => {
     expect(setCanvasNodeModel(initial, 'branch-1', 'gpt-5-mini').modelByNodeId).toEqual({
       'branch-1': 'gpt-5-mini',
     });
+  });
+
+  it('accepts a stored node model only while it remains in the runtime catalog', () => {
+    const catalog = {
+      models: ['deepseek-chat', 'qwen-max'],
+      defaultModel: 'deepseek-chat',
+    };
+
+    expect(resolveCanvasNodeModel('qwen-max', catalog)).toBe('qwen-max');
+    expect(resolveCanvasNodeModel('retired-model', catalog)).toBe('deepseek-chat');
   });
 });

@@ -3,8 +3,42 @@ import { expect, test } from '@playwright/test';
 test('runs the structured growth golden path in a browser', async ({ page }) => {
   await page.goto('/');
 
-  const trunk = page.getByLabel('主干活文档');
+  const trunk = page.getByRole('textbox', { name: '主干活文档' });
   await expect(trunk).toBeVisible();
+  await expect(page.getByLabel('主干生长点')).toBeVisible();
+
+  const trunkBox = await trunk.boundingBox();
+  if (!trunkBox) throw new Error('主干节点未渲染');
+  await page.mouse.move(trunkBox.x + 30, trunkBox.y + 30);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.up({ button: 'right' });
+  await expect(page.getByLabel('节点设置')).toContainText('主干活文档');
+
+  const trunkModel = page.getByLabel('主干活文档 模型');
+  const modelOptions = await trunkModel.locator('option').evaluateAll((options) => (
+    options.map((option) => (option as HTMLOptionElement).value)
+  ));
+  const currentModel = await trunkModel.inputValue();
+  expect(modelOptions.length).toBeGreaterThan(0);
+  expect(modelOptions).toContain(currentModel);
+  const alternativeModel = modelOptions.find((model) => model !== currentModel);
+  if (alternativeModel) {
+    await trunkModel.selectOption(alternativeModel);
+    await expect(trunkModel).toHaveValue(alternativeModel);
+  }
+
+  const plane = page.getByTestId('canvas-plane');
+  const initialTransform = await plane.evaluate((element) => getComputedStyle(element).transform);
+  const stage = page.getByLabel('结构化生长画布');
+  const stageBox = await stage.boundingBox();
+  if (!stageBox) throw new Error('画布未渲染');
+  await page.mouse.move(stageBox.x + stageBox.width - 90, stageBox.y + 200);
+  await page.mouse.down({ button: 'right' });
+  await page.waitForTimeout(280);
+  await page.mouse.move(stageBox.x + stageBox.width - 190, stageBox.y + 250);
+  await page.mouse.up({ button: 'right' });
+  await expect.poll(() => plane.evaluate((element) => getComputedStyle(element).transform)).not.toBe(initialTransform);
+
   await trunk.click();
   await page.keyboard.press('Control+A');
 
@@ -21,7 +55,7 @@ test('runs the structured growth golden path in a browser', async ({ page }) => 
 
   await expect(trunk).toHaveValue(/## 关于/);
   await page.reload();
-  await expect(page.getByLabel('主干活文档')).toHaveValue(/## 关于/);
+  await expect(page.getByRole('textbox', { name: '主干活文档' })).toHaveValue(/## 关于/);
 });
 
 test('shows the composer only inside the selected branch panel', async ({ page }) => {

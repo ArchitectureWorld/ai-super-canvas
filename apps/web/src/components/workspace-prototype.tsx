@@ -22,6 +22,7 @@ import {
   moveCanvasNode,
   normalizeWheelZoomDelta,
   panCanvas,
+  resolveCanvasNodeModel,
   setCanvasNodeModel,
   zoomCanvas,
   type CanvasLayoutState,
@@ -172,7 +173,7 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
     : { kind: 'trunk' as const, title: '主干活文档' };
   const selectedNodeWidth = selectedNode?.kind === 'trunk' ? 350 : selectedNode?.kind === 'humus' ? 250 : 290;
   const selectedNodeModel = selectedNode
-    ? layout.modelByNodeId[selectedNode.id] ?? modelCatalog.defaultModel
+    ? resolveCanvasNodeModel(layout.modelByNodeId[selectedNode.id], modelCatalog)
     : modelCatalog.defaultModel;
 
   function updateWorkspace(next: WorkspaceState): void {
