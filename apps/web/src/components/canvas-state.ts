@@ -23,6 +23,10 @@ export interface ComposerTarget {
   title: string;
 }
 
+const wheelPixelsPerLine = 16;
+const wheelPixelsPerPage = 800;
+const wheelPixelsPerZoomStep = 100;
+
 export function initialCanvasLayout(): CanvasLayoutState {
   return {
     positions: {},
@@ -58,6 +62,17 @@ export function moveCanvasNode(
       [nodeId]: { ...position, pinned: true },
     },
   };
+}
+
+export function normalizeWheelZoomDelta(deltaY: number, deltaMode: number): number {
+  if (deltaY === 0) return 0;
+  const pixelsPerUnit = deltaMode === 1
+    ? wheelPixelsPerLine
+    : deltaMode === 2
+      ? wheelPixelsPerPage
+      : 1;
+  const zoomDelta = -(deltaY * pixelsPerUnit) / wheelPixelsPerZoomStep;
+  return Math.max(-1, Math.min(1, zoomDelta));
 }
 
 export function zoomCanvas(

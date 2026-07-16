@@ -20,6 +20,7 @@ import {
   initialCanvasLayout,
   isBranchComposerSubmitDisabled,
   moveCanvasNode,
+  normalizeWheelZoomDelta,
   panCanvas,
   setCanvasNodeModel,
   zoomCanvas,
@@ -317,12 +318,14 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
 
   function handleCanvasWheel(event: WheelEvent<HTMLDivElement>): void {
     event.preventDefault();
+    const zoomDelta = normalizeWheelZoomDelta(event.deltaY, event.deltaMode);
+    if (zoomDelta === 0) return;
     const stageRect = event.currentTarget.getBoundingClientRect();
     const focalPoint = {
-      x: event.clientX - stageRect.left,
-      y: event.clientY - stageRect.top,
+      x: event.clientX - stageRect.left - event.currentTarget.clientLeft,
+      y: event.clientY - stageRect.top - event.currentTarget.clientTop,
     };
-    setLayout((state) => zoomCanvas(state, event.deltaY < 0 ? 1 : -1, focalPoint));
+    setLayout((state) => zoomCanvas(state, zoomDelta, focalPoint));
   }
 
   return (

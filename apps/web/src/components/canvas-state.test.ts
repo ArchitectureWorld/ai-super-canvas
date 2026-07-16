@@ -4,6 +4,7 @@ import {
   initialCanvasLayout,
   isBranchComposerSubmitDisabled,
   moveCanvasNode,
+  normalizeWheelZoomDelta,
   panCanvas,
   setCanvasNodeModel,
   zoomCanvas,
@@ -34,6 +35,24 @@ describe('canvas interaction state', () => {
   it('clamps canvas zoom to a usable desktop range', () => {
     expect(zoomCanvas(initialCanvasLayout(), 10).viewport.zoom).toBe(1.45);
     expect(zoomCanvas(initialCanvasLayout(), -10).viewport.zoom).toBe(0.55);
+  });
+
+  it('returns zero when a wheel event has no vertical movement', () => {
+    expect(normalizeWheelZoomDelta(0, 0)).toBe(0);
+  });
+
+  it('keeps small pixel wheel deltas proportional', () => {
+    expect(normalizeWheelZoomDelta(-8, 0)).toBeCloseTo(0.08);
+    expect(normalizeWheelZoomDelta(8, 0)).toBeCloseTo(-0.08);
+  });
+
+  it('normalizes line wheel deltas to pixel-sized zoom steps', () => {
+    expect(normalizeWheelZoomDelta(-3, 1)).toBeCloseTo(0.48);
+  });
+
+  it('clamps page wheel deltas to one zoom step per event', () => {
+    expect(normalizeWheelZoomDelta(-1, 2)).toBe(1);
+    expect(normalizeWheelZoomDelta(1, 2)).toBe(-1);
   });
 
   it('keeps the focal world point fixed while zooming a translated canvas', () => {
