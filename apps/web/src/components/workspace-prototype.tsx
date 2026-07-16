@@ -316,7 +316,12 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
 
   function handleCanvasWheel(event: WheelEvent<HTMLDivElement>): void {
     event.preventDefault();
-    setLayout((state) => zoomCanvas(state, event.deltaY < 0 ? 1 : -1));
+    const stageRect = event.currentTarget.getBoundingClientRect();
+    const focalPoint = {
+      x: event.clientX - stageRect.left,
+      y: event.clientY - stageRect.top,
+    };
+    setLayout((state) => zoomCanvas(state, event.deltaY < 0 ? 1 : -1, focalPoint));
   }
 
   return (

@@ -27,6 +27,42 @@ describe('canvas interaction state', () => {
     expect(zoomCanvas(initialCanvasLayout(), -10).viewport.zoom).toBe(0.55);
   });
 
+  it('keeps the focal world point fixed while zooming a translated canvas', () => {
+    const initial = {
+      ...initialCanvasLayout(),
+      viewport: { x: 120, y: -80, zoom: 0.8 },
+    };
+    const focalPoint = { x: 420, y: 260 };
+    const worldBefore = {
+      x: (focalPoint.x - initial.viewport.x) / initial.viewport.zoom,
+      y: (focalPoint.y - initial.viewport.y) / initial.viewport.zoom,
+    };
+
+    const zoomed = zoomCanvas(initial, 1, focalPoint);
+    const worldAfter = {
+      x: (focalPoint.x - zoomed.viewport.x) / zoomed.viewport.zoom,
+      y: (focalPoint.y - zoomed.viewport.y) / zoomed.viewport.zoom,
+    };
+
+    expect(zoomed.viewport.zoom).toBeCloseTo(0.9);
+    expect(worldAfter.x).toBeCloseTo(worldBefore.x);
+    expect(worldAfter.y).toBeCloseTo(worldBefore.y);
+  });
+
+  it.each([
+    { zoom: 1.45, delta: 1 },
+    { zoom: 0.55, delta: -1 },
+  ])('does not move the viewport when zoom stays clamped at $zoom', ({ zoom, delta }) => {
+    const initial = {
+      ...initialCanvasLayout(),
+      viewport: { x: 73, y: -41, zoom },
+    };
+
+    const zoomed = zoomCanvas(initial, delta, { x: 360, y: 240 });
+
+    expect(zoomed.viewport).toEqual(initial.viewport);
+  });
+
   it('derives consecutive pan positions from the fixed gesture origin', () => {
     const initial = {
       ...initialCanvasLayout(),

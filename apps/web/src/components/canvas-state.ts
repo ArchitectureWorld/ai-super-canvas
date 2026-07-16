@@ -53,9 +53,24 @@ export function moveCanvasNode(
   };
 }
 
-export function zoomCanvas(state: CanvasLayoutState, delta: number): CanvasLayoutState {
+export function zoomCanvas(
+  state: CanvasLayoutState,
+  delta: number,
+  focalPoint?: Pick<CanvasPosition, 'x' | 'y'>,
+): CanvasLayoutState {
   const zoom = Math.max(0.55, Math.min(1.45, state.viewport.zoom + delta * 0.1));
-  return { ...state, viewport: { ...state.viewport, zoom } };
+  if (!focalPoint || zoom === state.viewport.zoom) {
+    return { ...state, viewport: { ...state.viewport, zoom } };
+  }
+
+  return {
+    ...state,
+    viewport: {
+      x: focalPoint.x - ((focalPoint.x - state.viewport.x) / state.viewport.zoom) * zoom,
+      y: focalPoint.y - ((focalPoint.y - state.viewport.y) / state.viewport.zoom) * zoom,
+      zoom,
+    },
+  };
 }
 
 export function panCanvas(
