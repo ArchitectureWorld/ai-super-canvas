@@ -14,10 +14,13 @@ import {
   type GrowthNode,
   type WorkspaceState,
 } from '@ai-super-canvas/core';
+import type { ModelCatalog } from '@ai-super-canvas/ai';
 import {
   composerTargetLabel,
   initialCanvasLayout,
   moveCanvasNode,
+  panCanvas,
+  setCanvasNodeModel,
   zoomCanvas,
   type CanvasLayoutState,
 } from './canvas-state';
@@ -104,14 +107,21 @@ function initialStoredCanvasLayout(): CanvasLayoutState {
   if (!saved) return initialCanvasLayout();
   try {
     const parsed = JSON.parse(saved) as CanvasLayoutState;
-    return parsed.viewport && parsed.positions ? parsed : initialCanvasLayout();
+    return parsed.viewport && parsed.positions
+      ? { ...initialCanvasLayout(), ...parsed, modelByNodeId: parsed.modelByNodeId ?? {} }
+      : initialCanvasLayout();
   } catch {
     window.localStorage.removeItem(layoutStorageKey);
     return initialCanvasLayout();
   }
 }
 
-export function WorkspacePrototype() {
+function nodeIdFromEventTarget(target: EventTarget): string | null {
+  if (!(target instanceof Element)) return null;
+  return target.closest<HTMLElement>('[data-growth-node-id]')?.dataset.growthNodeId ?? null;
+}
+
+export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalog }) {
   const workspace = useSyncExternalStore(subscribeToWorkspace, getWorkspaceSnapshot, createDemoWorkspace);
   const [layout, setLayout] = useState<CanvasLayoutState>(initialStoredCanvasLayout);
   const [draftOverride, setDraftOverride] = useState<string | null>(null);
@@ -120,7 +130,13 @@ export function WorkspacePrototype() {
   const [selection, setSelection] = useState({ start: 0, end: 0 });
   const [previewCardId, setPreviewCardId] = useState<string | null>(null);
   const [drag, setDrag] = useState<{ nodeId: string; startX: number; startY: number; baseX: number; baseY: number } | null>(null);
-  const [pan, setPan] = useState<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
+  const [pan, setPan] = useState<{
+    lastX: number;
+    lastY: number;
+    startedAt: number;
+    nodeId: string | null;
+    isPanning: boolean;
+  } | null>(null);
   const trunkRef = useRef<HTMLTextAreaElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const draft = draftOverride ?? currentTrunkContent(workspace);
@@ -145,10 +161,15 @@ export function WorkspacePrototype() {
   const selectedMessages = selectedBranch
     ? workspace.messages.filter((message) => message.branchId === selectedBranch.id)
     : [];
+  const growthAnchors = workspace.anchors.filter((anchor) => workspace.branches.some((branch) => branch.anchorId === anchor.id));
   const hasSelection = selection.end > selection.start;
   const composerTarget = selectedBranch
     ? { kind: 'branch' as const, title: selectedBranch.title }
     : { kind: 'trunk' as const, title: '主干活文档' };
+  const selectedNodeWidth = selectedNode?.kind === 'trunk' ? 350 : selectedNode?.kind === 'humus' ? 250 : 290;
+  const selectedNodeModel = selectedNode
+    ? layout.modelByNodeId[selectedNode.id] ?? modelCatalog.defaultModel
+    : modelCatalog.defaultModel;
 
   function updateWorkspace(next: WorkspaceState): void {
     persistWorkspace(next);
@@ -260,6 +281,7 @@ export function WorkspacePrototype() {
   }
 
   function beginNodeDrag(event: ReactPointerEvent<HTMLDivElement>, node: GrowthNode): void {
+    if (event.button !== 0) return;
     event.stopPropagation();
     const current = nodeById.get(node.id) ?? node;
     setLayout((state) => ({ ...state, selectedNodeId: node.id }));
@@ -273,15 +295,26 @@ export function WorkspacePrototype() {
       setLayout((state) => moveCanvasNode(state, drag.nodeId, { x, y }));
     }
     if (pan) {
-      setLayout((state) => ({
-        ...state,
-        viewport: {
-          ...state.viewport,
-          x: pan.baseX + event.clientX - pan.startX,
-          y: pan.baseY + event.clientY - pan.startY,
-        },
+      if (!pan.isPanning && Date.now() - pan.startedAt < 260) return;
+      setLayout((state) => panCanvas(state, {
+        x: event.clientX - pan.lastX,
+        y: event.clientY - pan.lastY,
       }));
+      setPan((current) => current ? {
+        ...current,
+        lastX: event.clientX,
+        lastY: event.clientY,
+        isPanning: true,
+      } : null);
     }
+  }
+
+  function finishCanvasPointer(): void {
+    if (pan && !pan.isPanning && Date.now() - pan.startedAt < 260) {
+      setLayout((state) => ({ ...state, selectedNodeId: pan.nodeId ?? state.selectedNodeId }));
+    }
+    setDrag(null);
+    setPan(null);
   }
 
   function handleCanvasWheel(event: WheelEvent<HTMLDivElement>): void {
@@ -306,17 +339,24 @@ export function WorkspacePrototype() {
       {error ? <p className="canvas-error" role="alert">{error}</p> : null}
 
       <section
-        className="canvas-stage"
+        className={`canvas-stage ${pan?.isPanning ? 'panning' : ''}`}
         ref={canvasRef}
         aria-label="结构化生长画布"
         onPointerDown={(event) => {
-          if (event.target === event.currentTarget) {
-            setPan({ startX: event.clientX, startY: event.clientY, baseX: layout.viewport.x, baseY: layout.viewport.y });
-          }
+          if (event.button !== 2) return;
+          event.currentTarget.setPointerCapture(event.pointerId);
+          setPan({
+            lastX: event.clientX,
+            lastY: event.clientY,
+            startedAt: Date.now(),
+            nodeId: nodeIdFromEventTarget(event.target),
+            isPanning: false,
+          });
         }}
         onPointerMove={handleCanvasMove}
-        onPointerUp={() => { setDrag(null); setPan(null); }}
+        onPointerUp={finishCanvasPointer}
         onPointerLeave={() => { setDrag(null); setPan(null); }}
+        onContextMenu={(event) => event.preventDefault()}
         onWheel={handleCanvasWheel}
       >
         <aside className="canvas-rail" aria-label="画布工具">
@@ -329,6 +369,7 @@ export function WorkspacePrototype() {
 
         <div
           className="canvas-plane"
+          data-testid="canvas-plane"
           style={{ transform: `translate(${layout.viewport.x}px, ${layout.viewport.y}px) scale(${layout.viewport.zoom})` }}
         >
           <svg className="growth-edges" viewBox="0 0 1500 900" aria-hidden="true">
@@ -346,6 +387,7 @@ export function WorkspacePrototype() {
               <article
                 className={`growth-node ${node.kind} ${isSelected ? 'selected' : ''} ${node.status ?? ''}`}
                 key={node.id}
+                data-growth-node-id={node.id}
                 style={{ transform: `translate(${node.x}px, ${node.y}px)` }}
                 onClick={() => setLayout((state) => ({ ...state, selectedNodeId: node.id }))}
               >
@@ -358,6 +400,7 @@ export function WorkspacePrototype() {
                   {node.kind === 'trunk' ? (
                     <>
                       <p className="node-kicker">CURRENT UNDERSTANDING · V{workspace.trunk.revisions.length}</p>
+                      {growthAnchors.length ? <div className="anchor-rail" aria-label="主干生长点">{growthAnchors.map((anchor) => <button className="anchor-token" key={anchor.id} type="button" onClick={(event) => { event.stopPropagation(); setLayout((state) => ({ ...state, selectedNodeId: workspace.branches.find((branch) => branch.anchorId === anchor.id)?.id ?? 'trunk' })); }}><i />生长锚点 · “{anchor.selector.exact}”</button>)}</div> : null}
                       <textarea
                         ref={trunkRef}
                         aria-label="主干活文档"
@@ -398,22 +441,28 @@ export function WorkspacePrototype() {
               </article>
             );
           })}
-        </div>
 
-        {selectedNode ? (
-          <aside className="context-inspector" aria-label="上下文检查器">
-            <div className="inspector-header"><div><p>CONTEXT INSPECTOR</p><h2>{selectedNode.title}</h2></div><button type="button" onClick={() => setLayout((state) => ({ ...state, selectedNodeId: null }))}>×</button></div>
-            {selectedBranch ? (
-              <>
-                <p className="inspector-source">来源锚点：{workspace.anchors.find((item) => item.id === selectedBranch.anchorId)?.selector.exact ?? '不可用'}</p>
-                <div className="inspector-messages">{selectedMessages.map((message) => <p key={message.id}><b>{message.author === 'user' ? '你' : message.author === 'demo-ai' ? 'AI' : '系统'}</b>{message.content}</p>)}</div>
-                <div className="inspector-actions"><button type="button" onClick={createOutcome} disabled={selectedBranch.lifecycle !== 'active'}>提炼成果</button>{selectedBranch.lifecycle === 'active' ? <button type="button" onClick={() => changeLifecycle('dormant')}>设为休眠</button> : null}{selectedBranch.lifecycle === 'dormant' ? <button type="button" onClick={() => changeLifecycle('active')}>恢复生长</button> : null}{selectedBranch.lifecycle !== 'metabolized' ? <button type="button" onClick={() => changeLifecycle('metabolized')}>代谢为经验</button> : null}</div>
-              </>
-            ) : null}
-            {selectedCard ? <p className="inspector-source">成果状态：{readableCardStatus(selectedCard.status)}</p> : null}
-            {previewCardId && selectedCard?.id === previewCardId && selectedCard.status === 'ready' ? <div className="diff-preview"><p>将把以下内容追加为新的主干修订：</p><pre>## {selectedCard.title}{'\n'}{selectedCard.content}</pre><button type="button" onClick={() => integrateCard(selectedCard.id)}>确认回写主干</button></div> : null}
-          </aside>
-        ) : null}
+          {selectedNode ? (
+            <aside
+              className="node-popover"
+              aria-label="节点设置"
+              style={{ transform: `translate(${selectedNode.x + selectedNodeWidth + 16}px, ${selectedNode.y}px)` }}
+            >
+              <div className="inspector-header"><div><p>NODE CONTROLS</p><h2>{selectedNode.title}</h2></div><button type="button" onClick={() => setLayout((state) => ({ ...state, selectedNodeId: null }))}>×</button></div>
+              <label className="node-model-picker">此块使用的模型<select aria-label={`${selectedNode.title} 模型`} value={selectedNodeModel} onChange={(event) => setLayout((state) => setCanvasNodeModel(state, selectedNode.id, event.target.value))}>{modelCatalog.models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+              <p className="node-panel-note">仅作用于「{selectedNode.title}」；模型目录由统一环境配置提供。</p>
+              {selectedBranch ? (
+                <>
+                  <p className="inspector-source">来源生长锚点：{workspace.anchors.find((item) => item.id === selectedBranch.anchorId)?.selector.exact ?? '不可用'}</p>
+                  <div className="inspector-messages">{selectedMessages.map((message) => <p key={message.id}><b>{message.author === 'user' ? '你' : message.author === 'demo-ai' ? 'AI' : '系统'}</b>{message.content}</p>)}</div>
+                  <div className="inspector-actions"><button type="button" onClick={createOutcome} disabled={selectedBranch.lifecycle !== 'active'}>提炼成果</button>{selectedBranch.lifecycle === 'active' ? <button type="button" onClick={() => changeLifecycle('dormant')}>设为休眠</button> : null}{selectedBranch.lifecycle === 'dormant' ? <button type="button" onClick={() => changeLifecycle('active')}>恢复生长</button> : null}{selectedBranch.lifecycle !== 'metabolized' ? <button type="button" onClick={() => changeLifecycle('metabolized')}>代谢为经验</button> : null}</div>
+                </>
+              ) : null}
+              {selectedCard ? <p className="inspector-source">成果状态：{readableCardStatus(selectedCard.status)}</p> : null}
+              {previewCardId && selectedCard?.id === previewCardId && selectedCard.status === 'ready' ? <div className="diff-preview"><p>将把以下内容追加为新的主干修订：</p><pre>## {selectedCard.title}{'\n'}{selectedCard.content}</pre><button type="button" onClick={() => integrateCard(selectedCard.id)}>确认回写主干</button></div> : null}
+            </aside>
+          ) : null}
+        </div>
 
         <form className="canvas-composer" onSubmit={(event) => { event.preventDefault(); submitMessage(); }}>
           <div className="composer-chips"><span>{composerTargetLabel(composerTarget)}</span><span>{selectedBranch ? `${selectedMessages.length} 条消息` : '选择主干文字以创建分支'}</span></div>
