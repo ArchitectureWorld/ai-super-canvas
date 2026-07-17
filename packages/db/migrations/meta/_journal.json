@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1784185792850,
+      "tag": "0000_secret_hellion",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1784185808774,
+      "tag": "0001_s1_invariants",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1784188058704,
+      "tag": "0002_bouncy_thunderball",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1784188077531,
+      "tag": "0003_s1_compensation_state",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1784260283681,
+      "tag": "0004_s1_invariant_hardening",
+      "breakpoints": true
+    }
+  ]
+}

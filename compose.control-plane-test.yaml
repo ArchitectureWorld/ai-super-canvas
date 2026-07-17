@@ -1,0 +1,34 @@
+services:
+  postgres-test:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: canvas_s1_migrator
+      POSTGRES_PASSWORD: canvas-migrator-password
+      POSTGRES_DB: canvas_s1_test
+    volumes:
+      - ./packages/db/docker/init-test-app-role.sql:/docker-entrypoint-initdb.d/001-app-role.sql:ro
+      - postgres-s1-test-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U canvas_s1_migrator -d canvas_s1_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    working_dir: /workspace
+    environment:
+      NODE_ENV: test
+      ALLOW_TEST_DATABASE_RESET: "1"
+      DATABASE_URL: postgres://canvas_s1_migrator:canvas-migrator-password@postgres-test:5432/canvas_s1_test
+      APP_DATABASE_URL: postgres://canvas_s1_app:canvas-app-password@postgres-test:5432/canvas_s1_test
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    entrypoint: ["pnpm"]
+
+volumes:
+  postgres-s1-test-data: {}

@@ -14,7 +14,7 @@
     "lint": "pnpm -r --if-present lint",
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "vitest run --passWithNoTests",
-    "test:integration": "vitest run --passWithNoTests",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:e2e": "playwright test",
     "db:generate": "pnpm --filter @ai-super-canvas/db db:generate",
     "db:migrate": "pnpm --filter @ai-super-canvas/db db:migrate",

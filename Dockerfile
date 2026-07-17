@@ -19,6 +19,12 @@ COPY packages/ai/package.json packages/ai/package.json
 
 RUN pnpm install --frozen-lockfile
 
+FROM dependencies AS test
+
+COPY . .
+
+ENTRYPOINT ["pnpm"]
+
 FROM dependencies AS builder
 
 COPY . .
