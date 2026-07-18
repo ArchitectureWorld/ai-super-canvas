@@ -2108,4 +2108,102 @@ describe('PostgresControlPlaneRepository', () => {
       resolution_evidence: { listSessions: 'ambiguous' },
     });
   });
+
+  it('prepares one idempotent Run under concurrency and rejects payload or idempotency conflicts', async () => {
+    const fixture = await bootstrapFixture();
+    const session = await repository.createRootSession({
+      actor: fixture.actor,
+      commandId: '10101010-1010-4010-8010-101010101010',
+      workflowId: fixture.workflowId,
+      agentBindingId: fixture.agentBindingId,
+      title: '真实后端测试',
+    });
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: 'fake-session-repository-run',
+    });
+    await repository.attachRuntimeSession({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      runtimeSession: {
+        externalSessionRef: 'fake-session-repository-run',
+        runtimeVersion: 'deterministic-v1',
+        replayStatus: 'complete',
+        historyDigest: 'empty-history-digest',
+        metadata: {},
+      },
+    });
+
+    const input = {
+      actor: fixture.actor,
+      commandId: '11111111-1111-4111-8111-111111111111',
+      idempotencyKey: 'browser-run-1',
+      sessionId: session.sessionId,
+      content: '请返回确定性测试回复',
+    } as const;
+    const [first, replay] = await Promise.all([
+      repository.prepareRun(input),
+      repository.prepareRun({ ...input }),
+    ]);
+
+    expect(replay).toEqual(first);
+    expect(first.phase).toBe('canvas_prepared');
+    expect(first.status).toBe('queued');
+    expect(first.prompt).toMatchObject({ role: 'user', content: input.content });
+    expect(first.runtime.externalSessionRef).toBe('fake-session-repository-run');
+    expect(first.runtime.model).toMatchObject({
+      providerKey: 'fake',
+      modelKey: 'deterministic-v1',
+    });
+    expect(first.runtime.toolPolicy).toEqual({
+      allowedToolKeys: [],
+      deniedToolKeys: [],
+      approvalRequiredToolKeys: [],
+    });
+
+    await expect(
+      repository.prepareRun({
+        ...input,
+        content: '同一个 commandId 的不同内容',
+      }),
+    ).rejects.toThrow(/payload conflict/i);
+    await expect(
+      repository.prepareRun({
+        ...input,
+        commandId: '12121212-1212-4212-8212-121212121212',
+        content: '同一个 idempotencyKey 的不同命令',
+      }),
+    ).rejects.toThrow(/idempotency/i);
+
+    const [counts] = await sql<{
+      messages: number;
+      runs: number;
+      receipts: number;
+      start_run_receipts: number;
+    }[]>`
+      SELECT
+        (SELECT count(*)::integer FROM messages
+          WHERE session_id = ${session.sessionId}) AS messages,
+        (SELECT count(*)::integer FROM runs
+          WHERE session_id = ${session.sessionId}) AS runs,
+        (SELECT count(*)::integer FROM command_receipts
+          WHERE workflow_id = ${fixture.workflowId}
+            AND command_key = ${input.commandId}) AS receipts,
+        (SELECT count(*)::integer FROM command_receipts
+          WHERE workflow_id = ${fixture.workflowId}
+            AND command_type = 'start-run') AS start_run_receipts
+    `;
+    expect(counts).toEqual({
+      messages: 1,
+      runs: 1,
+      receipts: 1,
+      start_run_receipts: 1,
+    });
+  });
 });

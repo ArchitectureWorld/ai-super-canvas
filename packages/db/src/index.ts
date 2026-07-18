@@ -11,4 +11,5 @@ export function requireDatabaseUrl(
 }
 
 export * from './repositories/control-plane-repository';
+export * from './repositories/control-plane-run-types';
 export * from './repositories/postgres-control-plane-repository';

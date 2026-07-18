@@ -35,6 +35,14 @@ import {
   type TranscriptMessage,
   type UpdateSessionConfigInput,
 } from './control-plane-repository';
+import type {
+  PreparedRun,
+  PrepareRunInput,
+  RuntimeBindingSnapshot,
+  RuntimeContextSnapshot,
+  RuntimeToolPolicySnapshot,
+  StoredRunStatus,
+} from './control-plane-run-types';
 
 interface CanonicalPayload {
   bytes: Buffer;
@@ -71,6 +79,25 @@ interface AuthorizationRow {
   agent_binding_id: string;
   agent_id: string;
   runtime_kind: string;
+  isolation_key: string;
+  endpoint_ref: string | null;
+  secret_ref: string | null;
+}
+
+interface PrepareRunSessionRow {
+  status: string;
+  external_session_ref: string | null;
+  runtime_metadata: Record<string, unknown> | null;
+}
+
+interface RuntimeContextRow {
+  id: string;
+  scope: RuntimeContextSnapshot['scope'];
+  visibility: RuntimeContextSnapshot['visibility'];
+  source_kind: string;
+  source_ref: string;
+  snapshot: unknown;
+  provenance: Record<string, unknown>;
 }
 
 interface StoredModelRow {
@@ -223,6 +250,23 @@ function mapConfig(row: StoredConfigRow): StoredSessionConfig {
     instructionsOverlay: row.instructions_overlay,
     toolPolicy: row.tool_policy,
     contextPolicy: row.context_policy,
+  };
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    throw new Error('Stored Runtime tool policy is invalid');
+  }
+  return [...value];
+}
+
+function runtimeToolPolicy(
+  value: Record<string, unknown>,
+): RuntimeToolPolicySnapshot {
+  return {
+    allowedToolKeys: stringArray(value.allowedToolKeys),
+    deniedToolKeys: stringArray(value.deniedToolKeys),
+    approvalRequiredToolKeys: stringArray(value.approvalRequiredToolKeys),
   };
 }
 
@@ -419,7 +463,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       ? await tx<AuthorizationRow[]>`
           SELECT workflow.id AS workflow_id, workflow.workspace_id,
             binding.id AS agent_binding_id, binding.agent_id,
-            binding.runtime_kind::text AS runtime_kind
+            binding.runtime_kind::text AS runtime_kind, binding.isolation_key,
+            binding.endpoint_ref, binding.secret_ref
           FROM accounts account
           JOIN workflows workflow ON workflow.id = ${workflowId}
           JOIN workspace_members member
@@ -444,7 +489,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       : await tx<AuthorizationRow[]>`
           SELECT workflow.id AS workflow_id, workflow.workspace_id,
             binding.id AS agent_binding_id, binding.agent_id,
-            binding.runtime_kind::text AS runtime_kind
+            binding.runtime_kind::text AS runtime_kind, binding.isolation_key,
+            binding.endpoint_ref, binding.secret_ref
           FROM accounts account
           JOIN workflows workflow ON workflow.id = ${workflowId}
           JOIN workspace_members member
@@ -508,7 +554,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       ? tx<AuthorizationRow[]>`
           SELECT session.workflow_id, workflow.workspace_id,
             binding.id AS agent_binding_id, binding.agent_id,
-            binding.runtime_kind::text AS runtime_kind
+            binding.runtime_kind::text AS runtime_kind, binding.isolation_key,
+            binding.endpoint_ref, binding.secret_ref
           FROM sessions session
           JOIN workflows workflow ON workflow.id = session.workflow_id
           JOIN accounts account
@@ -536,7 +583,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       : tx<AuthorizationRow[]>`
           SELECT session.workflow_id, workflow.workspace_id,
             binding.id AS agent_binding_id, binding.agent_id,
-            binding.runtime_kind::text AS runtime_kind
+            binding.runtime_kind::text AS runtime_kind, binding.isolation_key,
+            binding.endpoint_ref, binding.secret_ref
           FROM sessions session
           JOIN workflows workflow ON workflow.id = session.workflow_id
           JOIN accounts account
@@ -1416,6 +1464,223 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       await tx`
         UPDATE command_receipts
         SET result_type = 'session', result_id = ${sessionId},
+          result_payload = ${tx.json(result as unknown as postgres.JSONValue)}
+        WHERE id = ${receipt.id}
+      `;
+      return result;
+    });
+  }
+
+  async prepareRun(input: PrepareRunInput): Promise<PreparedRun> {
+    return this.sql.begin(async (tx) => {
+      const authorization = await this.authorizeSession(
+        tx,
+        input.actor,
+        input.sessionId,
+        { lock: true, write: true },
+      );
+      const payload = toCanonicalPayload({
+        sessionId: input.sessionId,
+        idempotencyKey: input.idempotencyKey,
+        content: input.content,
+      });
+
+      const proposedReceiptId = randomUUID();
+      await tx`
+        INSERT INTO command_receipts (
+          id, workflow_id, account_id, command_key, command_type,
+          payload_hash, payload_canonical
+        ) VALUES (
+          ${proposedReceiptId}, ${authorization.workflow_id}, ${input.actor.accountId},
+          ${input.commandId}, 'start-run', ${payload.hash}, ${payload.text}
+        )
+        ON CONFLICT (workflow_id, command_key) DO NOTHING
+      `;
+      const [receipt] = await tx<CommandReceiptRow[]>`
+        SELECT id, payload_hash, payload_canonical, orchestration_phase,
+          result_type, result_id, result_payload
+        FROM command_receipts
+        WHERE workflow_id = ${authorization.workflow_id}
+          AND command_key = ${input.commandId}
+        FOR UPDATE
+      `;
+      if (!receipt) throw new Error('Run command receipt disappeared');
+      if (!exactCommandPayloadMatches(receipt, payload)) {
+        throw new CommandPayloadConflictError(input.commandId);
+      }
+      if (receipt.result_payload !== null) {
+        const value = receipt.result_payload;
+        const record = value !== null && typeof value === 'object' && !Array.isArray(value)
+          ? value as Record<string, unknown>
+          : null;
+        if (
+          receipt.result_type !== 'run'
+          || receipt.result_id === null
+          || record === null
+          || record.commandReceiptId !== receipt.id
+          || record.workflowId !== authorization.workflow_id
+          || record.sessionId !== input.sessionId
+          || record.runId !== receipt.result_id
+          || record.prompt === null
+          || typeof record.prompt !== 'object'
+          || Array.isArray(record.prompt)
+          || record.runtime === null
+          || typeof record.runtime !== 'object'
+          || Array.isArray(record.runtime)
+        ) {
+          throw new Error('Invalid persisted Run command result payload');
+        }
+        const [run] = await tx<{ status: StoredRunStatus }[]>`
+          SELECT status::text AS status
+          FROM runs
+          WHERE id = ${receipt.result_id} AND session_id = ${input.sessionId}
+        `;
+        if (!run) throw new Error('Invalid persisted Run result DB identity');
+        return {
+          ...(record as unknown as PreparedRun),
+          commandReceiptId: receipt.id,
+          phase: receipt.orchestration_phase,
+          workflowId: authorization.workflow_id,
+          sessionId: input.sessionId,
+          runId: receipt.result_id,
+          status: run.status,
+        };
+      }
+
+      const [session] = await tx<PrepareRunSessionRow[]>`
+        SELECT session.status::text AS status,
+          runtime_ref.external_session_ref,
+          runtime_ref.metadata AS runtime_metadata
+        FROM sessions session
+        LEFT JOIN session_runtime_refs runtime_ref
+          ON runtime_ref.session_id = session.id
+         AND runtime_ref.is_primary = true
+         AND runtime_ref.status = 'active'
+        WHERE session.id = ${input.sessionId}
+      `;
+      if (!session || session.status !== 'active') {
+        throw new Error('Session must be active to prepare a Run');
+      }
+      if (session.external_session_ref === null) {
+        throw new Error('Session has no active primary Runtime reference');
+      }
+      const historyDigest = session.runtime_metadata?.historyDigest;
+      if (typeof historyDigest !== 'string') {
+        throw new Error('Session Runtime reference has no history digest');
+      }
+
+      const config = await this.loadConfig(tx, input.sessionId);
+      const model = {
+        providerKey: config.model.providerKey,
+        modelKey: config.model.modelKey,
+      };
+      const toolPolicy = runtimeToolPolicy(config.toolPolicy);
+      const contextRows = await tx<RuntimeContextRow[]>`
+        SELECT id, scope::text AS scope, visibility::text AS visibility,
+          source_kind, source_ref, snapshot, provenance
+        FROM context_refs
+        WHERE (expires_at IS NULL OR expires_at > now())
+          AND (
+            (visibility = 'private' AND account_id = ${input.actor.accountId})
+            OR visibility = 'workspace'
+          )
+          AND (
+            (scope = 'account' AND account_id = ${input.actor.accountId})
+            OR (scope = 'agent' AND agent_id = ${authorization.agent_id})
+            OR (scope = 'workflow' AND workflow_id = ${authorization.workflow_id})
+            OR (scope = 'session' AND session_id = ${input.sessionId})
+          )
+        ORDER BY created_at, id
+      `;
+      const context: RuntimeContextSnapshot[] = contextRows.map((row) => ({
+        canvasContextRefId: row.id,
+        scope: row.scope,
+        visibility: row.visibility,
+        content: row.snapshot,
+        provenance: {
+          ...row.provenance,
+          sourceKind: row.source_kind,
+          sourceRef: row.source_ref,
+        },
+      }));
+
+      const [idempotentRun] = await tx<{ id: string }[]>`
+        SELECT id FROM runs
+        WHERE session_id = ${input.sessionId}
+          AND idempotency_key = ${input.idempotencyKey}
+      `;
+      if (idempotentRun) {
+        throw new Error(`Run idempotency conflict for ${input.idempotencyKey}`);
+      }
+      const [nextMessage] = await tx<{ ordinal: number }[]>`
+        SELECT (COALESCE(MAX(ordinal), -1) + 1)::integer AS ordinal
+        FROM messages
+        WHERE session_id = ${input.sessionId}
+      `;
+      if (!nextMessage) throw new Error('Next Session Message ordinal is unavailable');
+
+      const canvasMessageId = randomUUID();
+      await tx`
+        INSERT INTO messages (
+          id, workflow_id, session_id, ordinal, role,
+          actor_account_id, content, status
+        ) VALUES (
+          ${canvasMessageId}, ${authorization.workflow_id}, ${input.sessionId},
+          ${nextMessage.ordinal}, 'user', ${input.actor.accountId},
+          ${tx.json(input.content)}, 'completed'
+        )
+      `;
+
+      const runId = randomUUID();
+      await tx`
+        INSERT INTO runs (
+          id, session_id, agent_binding_id, config_revision_id,
+          trigger_message_id, idempotency_key, status, model_snapshot,
+          tool_policy_snapshot, context_policy_snapshot
+        ) VALUES (
+          ${runId}, ${input.sessionId}, ${authorization.agent_binding_id}, ${config.id},
+          ${canvasMessageId}, ${input.idempotencyKey}, 'queued', ${tx.json(model)},
+          ${tx.json(toolPolicy as unknown as postgres.JSONValue)},
+          ${tx.json(context as unknown as postgres.JSONValue)}
+        )
+      `;
+
+      const binding: RuntimeBindingSnapshot = {
+        canvasAgentBindingId: authorization.agent_binding_id,
+        agentId: authorization.agent_id,
+        runtimeKind: authorization.runtime_kind,
+        isolationKey: authorization.isolation_key,
+        ...(authorization.endpoint_ref === null
+          ? {}
+          : { endpointRef: authorization.endpoint_ref }),
+        ...(authorization.secret_ref === null
+          ? {}
+          : { secretRef: authorization.secret_ref }),
+      };
+      const result: PreparedRun = {
+        commandReceiptId: receipt.id,
+        phase: receipt.orchestration_phase,
+        workflowId: authorization.workflow_id,
+        sessionId: input.sessionId,
+        runId,
+        status: 'queued',
+        prompt: {
+          canvasMessageId,
+          role: 'user',
+          content: input.content,
+        },
+        runtime: {
+          binding,
+          externalSessionRef: session.external_session_ref,
+          expectedHistoryDigest: historyDigest,
+          model,
+          toolPolicy,
+          context,
+        },
+      };
+      await tx`
+        UPDATE command_receipts
+        SET result_type = 'run', result_id = ${runId},
           result_payload = ${tx.json(result as unknown as postgres.JSONValue)}
         WHERE id = ${receipt.id}
       `;

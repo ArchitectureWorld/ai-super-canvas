@@ -4,6 +4,8 @@ import type {
   ForkMessageSessionCommand,
 } from '@ai-super-canvas/core';
 
+import type { PrepareRunInput, PreparedRun } from './control-plane-run-types';
+
 export interface LocalAlphaModelSeed {
   providerKey: string;
   modelKey: string;
@@ -288,6 +290,7 @@ export interface ControlPlaneRepository {
     input: PrepareAnchoredSessionInput,
   ): Promise<PreparedAnchoredSession>;
   prepareFork(input: PrepareForkInput): Promise<PreparedFork>;
+  prepareRun(input: PrepareRunInput): Promise<PreparedRun>;
   hydrateWorkflow(input: {
     actor: ActorContext;
     workflowId: string;
