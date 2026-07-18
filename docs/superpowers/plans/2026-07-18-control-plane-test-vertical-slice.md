@@ -305,17 +305,12 @@ export interface StoredSessionSnapshot {
 
 - [ ] **Step 4: 扩展 Repository 接口并公开导出**
 
-在 `control-plane-repository.ts` 中导入新增类型：
+在 `control-plane-repository.ts` 中先导入 Task 1 实际使用的新增类型：
 
 ```ts
 import type {
-  PersistableRunEvent,
   PreparedRun,
   PrepareRunInput,
-  RunRuntimeContext,
-  RuntimeRunAttachment,
-  StoredRunEvent,
-  StoredSessionSnapshot,
 } from './control-plane-run-types';
 ```
 
@@ -323,6 +318,13 @@ import type {
 
 ```ts
 prepareRun(input: PrepareRunInput): Promise<PreparedRun>;
+```
+
+其余 Run/event/snapshot 方法在 Task 2 实现时再加入接口，确保 Task 1
+提交本身可以通过 `PostgresControlPlaneRepository implements
+ControlPlaneRepository` 的类型检查。Task 2 需补充导入并增加：
+
+```ts
 attachRuntimeRun(input: {
   actor: ActorContext;
   commandReceiptId: string;
