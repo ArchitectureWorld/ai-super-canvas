@@ -2206,4 +2206,421 @@ describe('PostgresControlPlaneRepository', () => {
       start_run_receipts: 1,
     });
   });
+
+  it('rejects malformed stored Runtime tool policies without leaving Run state', async () => {
+    const fixture = await bootstrapFixture();
+    const session = await repository.createRootSession({
+      actor: fixture.actor,
+      commandId: '13131313-1010-4010-8010-101010101010',
+      workflowId: fixture.workflowId,
+      agentBindingId: fixture.agentBindingId,
+      title: 'Malformed tool policy Session',
+    });
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: 'fake-session-malformed-tool-policy',
+    });
+    await repository.attachRuntimeSession({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      runtimeSession: {
+        externalSessionRef: 'fake-session-malformed-tool-policy',
+        runtimeVersion: 'deterministic-v1',
+        replayStatus: 'complete',
+        historyDigest: 'malformed-tool-policy-history',
+        metadata: {},
+      },
+    });
+
+    async function attempt(
+      commandId: string,
+      idempotencyKey: string,
+      toolPolicy: postgres.JSONValue,
+    ) {
+      if (toolPolicy === null) {
+        await sql`
+          UPDATE session_config_revisions
+          SET tool_policy = 'null'::jsonb
+          WHERE session_id = ${session.sessionId}
+        `;
+      } else {
+        await sql`
+          UPDATE session_config_revisions
+          SET tool_policy = ${sql.json(toolPolicy)}
+          WHERE session_id = ${session.sessionId}
+        `;
+      }
+      const error = await repository.prepareRun({
+        actor: fixture.actor,
+        commandId,
+        idempotencyKey,
+        sessionId: session.sessionId,
+        content: 'This Run must roll back',
+      }).then(() => null, (reason: unknown) => reason);
+      const [counts] = await sql<{
+        messages: number;
+        runs: number;
+        receipts: number;
+      }[]>`
+        SELECT
+          (SELECT count(*)::integer FROM messages
+            WHERE session_id = ${session.sessionId}) AS messages,
+          (SELECT count(*)::integer FROM runs
+            WHERE session_id = ${session.sessionId}) AS runs,
+          (SELECT count(*)::integer FROM command_receipts
+            WHERE workflow_id = ${fixture.workflowId}
+              AND command_type = 'start-run') AS receipts
+      `;
+      return { error, counts };
+    }
+
+    const jsonNull = await attempt(
+      '14141414-1010-4010-8010-101010101010',
+      'malformed-policy-null',
+      null,
+    );
+    const invalidField = await attempt(
+      '15151515-1010-4010-8010-101010101010',
+      'malformed-policy-field',
+      {
+        allowedToolKeys: ['read'],
+        deniedToolKeys: 'not-an-array',
+        approvalRequiredToolKeys: [],
+      },
+    );
+
+    for (const result of [jsonNull, invalidField]) {
+      expect(result.error).toBeInstanceOf(Error);
+      expect((result.error as Error).message).toBe(
+        'Stored Runtime tool policy is invalid',
+      );
+      expect(result.counts).toEqual({ messages: 0, runs: 0, receipts: 0 });
+    }
+  });
+
+  it('replays current Run state and rejects corrupted persisted PreparedRun payloads', async () => {
+    const fixture = await bootstrapFixture();
+    const session = await repository.createRootSession({
+      actor: fixture.actor,
+      commandId: '16161616-1010-4010-8010-101010101010',
+      workflowId: fixture.workflowId,
+      agentBindingId: fixture.agentBindingId,
+      title: 'Strict Run replay Session',
+    });
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: 'fake-session-strict-run-replay',
+    });
+    await repository.attachRuntimeSession({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      runtimeSession: {
+        externalSessionRef: 'fake-session-strict-run-replay',
+        runtimeVersion: 'deterministic-v1',
+        replayStatus: 'complete',
+        historyDigest: 'strict-run-replay-history',
+        metadata: {},
+      },
+    });
+    const input = {
+      actor: fixture.actor,
+      commandId: '17171717-1010-4010-8010-101010101010',
+      idempotencyKey: 'strict-run-replay',
+      sessionId: session.sessionId,
+      content: 'Replay this prepared Run strictly',
+    } as const;
+    const first = await repository.prepareRun(input);
+
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: first.commandReceiptId,
+    });
+    await sql`UPDATE runs SET status = 'running' WHERE id = ${first.runId}`;
+    await expect(repository.prepareRun({ ...input })).resolves.toMatchObject({
+      phase: 'runtime_dispatched',
+      status: 'running',
+    });
+
+    const [sourceReceipt] = await sql<{
+      payload_hash: string;
+      payload_canonical: string;
+    }[]>`
+      SELECT payload_hash, payload_canonical
+      FROM command_receipts
+      WHERE id = ${first.commandReceiptId}
+    `;
+    if (!sourceReceipt) throw new Error('Prepared Run receipt fixture is missing');
+    const corruptReceiptId = '18181818-1010-4010-8010-101010101010';
+    const corruptCommandId = '19191919-1010-4010-8010-101010101010';
+    await sql`
+      INSERT INTO command_receipts (
+        id, workflow_id, account_id, command_key, command_type,
+        payload_hash, payload_canonical, orchestration_phase,
+        result_type, result_id, result_payload
+      ) VALUES (
+        ${corruptReceiptId}, ${fixture.workflowId}, ${fixture.accountId},
+        ${corruptCommandId}, 'start-run', ${sourceReceipt.payload_hash},
+        ${sourceReceipt.payload_canonical}, 'runtime_dispatched', 'run', ${first.runId},
+        ${sql.json({
+          ...first,
+          commandReceiptId: corruptReceiptId,
+          prompt: {},
+          runtime: {},
+        })}
+      )
+    `;
+    await expect(repository.prepareRun({
+      ...input,
+      commandId: corruptCommandId,
+    })).rejects.toThrow(
+      /invalid persisted Run command result payload/i,
+    );
+
+    const wrongTypeReceiptId = '20202020-1010-4010-8010-101010101010';
+    const wrongTypeCommandId = '21212121-1010-4010-8010-101010101010';
+    await sql`
+      INSERT INTO command_receipts (
+        id, workflow_id, account_id, command_key, command_type,
+        payload_hash, payload_canonical, orchestration_phase,
+        result_type, result_id, result_payload
+      ) VALUES (
+        ${wrongTypeReceiptId}, ${fixture.workflowId}, ${fixture.accountId},
+        ${wrongTypeCommandId}, 'create-root-session', ${sourceReceipt.payload_hash},
+        ${sourceReceipt.payload_canonical}, 'runtime_dispatched', 'run', ${first.runId},
+        ${sql.json({
+          ...first,
+          commandReceiptId: wrongTypeReceiptId,
+        } as unknown as postgres.JSONValue)}
+      )
+    `;
+    await expect(repository.prepareRun({
+      ...input,
+      commandId: wrongTypeCommandId,
+    })).rejects.toThrow(
+      /invalid persisted Run command result payload/i,
+    );
+
+    const nullPayloadCommandId = '37373737-1010-4010-8010-101010101010';
+    await sql`
+      INSERT INTO command_receipts (
+        id, workflow_id, account_id, command_key, command_type,
+        payload_hash, payload_canonical, orchestration_phase,
+        result_type, result_id, result_payload
+      ) VALUES (
+        '38383838-1010-4010-8010-101010101010', ${fixture.workflowId},
+        ${fixture.accountId}, ${nullPayloadCommandId}, 'start-run',
+        ${sourceReceipt.payload_hash}, ${sourceReceipt.payload_canonical},
+        'runtime_dispatched', 'run', ${first.runId}, 'null'::jsonb
+      )
+    `;
+    await expect(repository.prepareRun({
+      ...input,
+      commandId: nullPayloadCommandId,
+    })).rejects.toThrow(/invalid persisted Run command result payload/i);
+  });
+
+  it('freezes server-selected model, tool, and authorized context snapshots', async () => {
+    const fixture = await bootstrapFixture();
+    const session = await repository.createRootSession({
+      actor: fixture.actor,
+      commandId: '34343434-1010-4010-8010-101010101010',
+      workflowId: fixture.workflowId,
+      agentBindingId: fixture.agentBindingId,
+      title: 'Server snapshot Session',
+    });
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: 'fake-session-server-snapshots',
+    });
+    await repository.attachRuntimeSession({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      runtimeSession: {
+        externalSessionRef: 'fake-session-server-snapshots',
+        runtimeVersion: 'deterministic-v1',
+        replayStatus: 'complete',
+        historyDigest: 'server-snapshot-history',
+        metadata: {},
+      },
+    });
+
+    const [modelV2] = await sql<{ id: string }[]>`
+      SELECT id FROM model_catalog_entries
+      WHERE runtime_kind = 'fake'
+        AND provider_key = 'fake'
+        AND model_key = 'deterministic-v2'
+    `;
+    if (!modelV2) throw new Error('deterministic-v2 fixture is missing');
+    const serverToolPolicy = {
+      allowedToolKeys: ['search', 'read'],
+      deniedToolKeys: ['shell'],
+      approvalRequiredToolKeys: ['write'],
+    };
+    await sql`
+      INSERT INTO session_config_revisions (
+        id, session_id, version, model_entry_id, tool_policy,
+        context_policy, created_by_account_id
+      ) VALUES (
+        '22222222-1010-4010-8010-101010101010', ${session.sessionId}, 2,
+        ${modelV2.id}, ${sql.json(serverToolPolicy)}, '{}'::jsonb,
+        ${fixture.accountId}
+      )
+    `;
+    const otherAccountId = '23232323-1010-4010-8010-101010101010';
+    await sql`
+      INSERT INTO accounts (id, auth_subject, display_name)
+      VALUES (${otherAccountId}, 'local:other-context-owner', 'Other context owner')
+    `;
+    await sql`
+      INSERT INTO context_refs (
+        id, account_id, agent_id, workflow_id, session_id,
+        scope, visibility, source_kind, source_ref, snapshot, provenance, expires_at
+      ) VALUES
+        (
+          '24242424-1010-4010-8010-101010101010', ${fixture.accountId}, NULL,
+          NULL, NULL, 'account', 'private', 'repository-test',
+          'context:account-private', ${sql.json({ label: 'account-private' })},
+          ${sql.json({ fixture: 'account-private', sourceKind: 'forged', sourceRef: 'forged' })},
+          NULL
+        ),
+        (
+          '26262626-1010-4010-8010-101010101010', ${fixture.accountId},
+          ${fixture.agentId}, NULL, NULL, 'agent', 'private', 'repository-test',
+          'context:agent-private', ${sql.json({ label: 'agent-private' })},
+          ${sql.json({ fixture: 'agent-private', sourceKind: 'forged', sourceRef: 'forged' })},
+          NULL
+        ),
+        (
+          '28282828-1010-4010-8010-101010101010', ${fixture.accountId}, NULL,
+          ${fixture.workflowId}, NULL, 'workflow', 'private', 'repository-test',
+          'context:workflow-private', ${sql.json({ label: 'workflow-private' })},
+          ${sql.json({ fixture: 'workflow-private', sourceKind: 'forged', sourceRef: 'forged' })},
+          NULL
+        ),
+        (
+          '29292929-1010-4010-8010-101010101010', ${fixture.accountId}, NULL,
+          ${fixture.workflowId}, NULL, 'workflow', 'workspace', 'repository-test',
+          'context:workflow-workspace', ${sql.json({ label: 'workflow-workspace' })},
+          ${sql.json({ fixture: 'workflow-workspace', sourceKind: 'forged', sourceRef: 'forged' })},
+          NULL
+        ),
+        (
+          '30303030-1010-4010-8010-101010101010', ${fixture.accountId}, NULL,
+          ${fixture.workflowId}, ${session.sessionId}, 'session', 'private',
+          'repository-test', 'context:session-private',
+          ${sql.json({ label: 'session-private' })},
+          ${sql.json({ fixture: 'session-private', sourceKind: 'forged', sourceRef: 'forged' })},
+          NULL
+        ),
+        (
+          '31313131-1010-4010-8010-101010101010', ${fixture.accountId}, NULL,
+          ${fixture.workflowId}, ${session.sessionId}, 'session', 'workspace',
+          'repository-test', 'context:session-workspace',
+          ${sql.json({ label: 'session-workspace' })},
+          ${sql.json({ fixture: 'session-workspace', sourceKind: 'forged', sourceRef: 'forged' })},
+          NULL
+        ),
+        (
+          '32323232-1010-4010-8010-101010101010', ${fixture.accountId}, NULL,
+          ${fixture.workflowId}, ${session.sessionId}, 'session', 'private',
+          'repository-test', 'context:expired', ${sql.json({ label: 'expired' })},
+          ${sql.json({ fixture: 'expired' })}, now() - interval '1 minute'
+        ),
+        (
+          '33333333-1010-4010-8010-101010101010', ${otherAccountId}, NULL,
+          ${fixture.workflowId}, NULL, 'workflow', 'private', 'repository-test',
+          'context:other-private', ${sql.json({ label: 'other-private' })},
+          ${sql.json({ fixture: 'other-private' })}, NULL
+        )
+    `;
+
+    const expectedContext = [
+      ['24242424-1010-4010-8010-101010101010', 'account', 'private', 'account-private'],
+      ['26262626-1010-4010-8010-101010101010', 'agent', 'private', 'agent-private'],
+      ['28282828-1010-4010-8010-101010101010', 'workflow', 'private', 'workflow-private'],
+      ['29292929-1010-4010-8010-101010101010', 'workflow', 'workspace', 'workflow-workspace'],
+      ['30303030-1010-4010-8010-101010101010', 'session', 'private', 'session-private'],
+      ['31313131-1010-4010-8010-101010101010', 'session', 'workspace', 'session-workspace'],
+    ].map(([canvasContextRefId, scope, visibility, label]) => ({
+      canvasContextRefId,
+      scope,
+      visibility,
+      content: { label },
+      provenance: {
+        fixture: label,
+        sourceKind: 'repository-test',
+        sourceRef: `context:${label}`,
+      },
+    }));
+    const input = {
+      actor: fixture.actor,
+      commandId: '35353535-1010-4010-8010-101010101010',
+      idempotencyKey: 'server-snapshot-run',
+      sessionId: session.sessionId,
+      content: 'Use only server-selected snapshots',
+    } as const;
+    const forgedInput = {
+      ...input,
+      model: { providerKey: 'caller', modelKey: 'forged' },
+      toolPolicy: { allowedToolKeys: ['dangerous-caller-tool'] },
+      context: [{ content: 'caller-forged-context' }],
+    };
+    const prepared = await repository.prepareRun(forgedInput);
+
+    expect(prepared.runtime.model).toEqual({
+      providerKey: 'fake',
+      modelKey: 'deterministic-v2',
+    });
+    expect(prepared.runtime.toolPolicy).toEqual(serverToolPolicy);
+    expect(prepared.runtime.context).toEqual(expectedContext);
+    const [snapshots] = await sql<{
+      model_snapshot: unknown;
+      tool_policy_snapshot: unknown;
+      context_snapshot: unknown;
+    }[]>`
+      SELECT model_snapshot, tool_policy_snapshot,
+        context_policy_snapshot AS context_snapshot
+      FROM runs
+      WHERE id = ${prepared.runId}
+    `;
+    expect(snapshots).toEqual({
+      model_snapshot: prepared.runtime.model,
+      tool_policy_snapshot: serverToolPolicy,
+      context_snapshot: expectedContext,
+    });
+
+    await sql`
+      INSERT INTO session_config_revisions (
+        id, session_id, version, model_entry_id, tool_policy,
+        context_policy, created_by_account_id
+      ) VALUES (
+        '36363636-1010-4010-8010-101010101010', ${session.sessionId}, 3,
+        ${fixture.defaultModelEntryId}, ${sql.json({
+          allowedToolKeys: [],
+          deniedToolKeys: [],
+          approvalRequiredToolKeys: [],
+        })}, '{}'::jsonb, ${fixture.accountId}
+      )
+    `;
+    await sql`DELETE FROM context_refs`;
+    await expect(repository.prepareRun({ ...input })).resolves.toEqual(prepared);
+  });
 });

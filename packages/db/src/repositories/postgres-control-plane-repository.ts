@@ -40,6 +40,7 @@ import type {
   PrepareRunInput,
   RuntimeBindingSnapshot,
   RuntimeContextSnapshot,
+  RuntimeModelSnapshot,
   RuntimeToolPolicySnapshot,
   StoredRunStatus,
 } from './control-plane-run-types';
@@ -73,6 +74,12 @@ interface CommandReceiptRow {
   result_payload: unknown;
 }
 
+interface RunCommandReceiptRow extends CommandReceiptRow {
+  account_id: string;
+  command_type: string;
+  has_result_payload: boolean;
+}
+
 interface AuthorizationRow {
   workflow_id: string;
   workspace_id: string;
@@ -98,6 +105,23 @@ interface RuntimeContextRow {
   source_ref: string;
   snapshot: unknown;
   provenance: Record<string, unknown>;
+}
+
+interface PreparedRunReplayRow {
+  run_id: string;
+  status: StoredRunStatus;
+  session_id: string;
+  agent_binding_id: string;
+  trigger_message_id: string;
+  model_snapshot: unknown;
+  tool_policy_snapshot: unknown;
+  context_policy_snapshot: unknown;
+  workflow_id: string;
+  message_id: string;
+  message_session_id: string;
+  message_workflow_id: string;
+  message_role: string;
+  message_content: unknown;
 }
 
 interface StoredModelRow {
@@ -261,12 +285,279 @@ function stringArray(value: unknown): string[] {
 }
 
 function runtimeToolPolicy(
-  value: Record<string, unknown>,
+  value: unknown,
 ): RuntimeToolPolicySnapshot {
+  const record = plainRecord(value);
+  if (!record) {
+    throw new Error('Stored Runtime tool policy is invalid');
+  }
   return {
-    allowedToolKeys: stringArray(value.allowedToolKeys),
-    deniedToolKeys: stringArray(value.deniedToolKeys),
-    approvalRequiredToolKeys: stringArray(value.approvalRequiredToolKeys),
+    allowedToolKeys: stringArray(record.allowedToolKeys),
+    deniedToolKeys: stringArray(record.deniedToolKeys),
+    approvalRequiredToolKeys: stringArray(record.approvalRequiredToolKeys),
+  };
+}
+
+const storedRunStatuses = new Set<StoredRunStatus>([
+  'queued',
+  'running',
+  'waiting_approval',
+  'reconciling',
+  'succeeded',
+  'failed',
+  'cancelled',
+]);
+
+const orchestrationPhases = new Set<PreparedRun['phase']>([
+  'canvas_prepared',
+  'runtime_dispatched',
+  'runtime_known',
+  'attached',
+  'reconciling',
+  'retryable_failure',
+  'terminal_failure',
+]);
+
+const contextScopes = new Set<RuntimeContextSnapshot['scope']>([
+  'account',
+  'agent',
+  'workflow',
+  'session',
+  'run',
+]);
+
+const contextVisibilities = new Set<RuntimeContextSnapshot['visibility']>([
+  'private',
+  'workspace',
+]);
+
+function plainRecord(value: unknown): Record<string, unknown> | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function hasExactKeys(
+  record: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.prototype.hasOwnProperty.call(record, key))
+    && Object.keys(record).every((key) => allowed.has(key));
+}
+
+function invalidPreparedRun(): never {
+  throw new Error('Invalid persisted Run command result payload');
+}
+
+function parseRuntimeModelSnapshot(value: unknown): RuntimeModelSnapshot {
+  const record = plainRecord(value);
+  if (
+    !record
+    || !hasExactKeys(record, ['providerKey', 'modelKey'])
+    || typeof record.providerKey !== 'string'
+    || typeof record.modelKey !== 'string'
+  ) {
+    return invalidPreparedRun();
+  }
+  return {
+    providerKey: record.providerKey,
+    modelKey: record.modelKey,
+  };
+}
+
+function parseRuntimeBindingSnapshot(value: unknown): RuntimeBindingSnapshot {
+  const record = plainRecord(value);
+  if (
+    !record
+    || !hasExactKeys(
+      record,
+      ['canvasAgentBindingId', 'agentId', 'runtimeKind', 'isolationKey'],
+      ['endpointRef', 'secretRef'],
+    )
+    || typeof record.canvasAgentBindingId !== 'string'
+    || !uuidPattern.test(record.canvasAgentBindingId)
+    || typeof record.agentId !== 'string'
+    || !uuidPattern.test(record.agentId)
+    || typeof record.runtimeKind !== 'string'
+    || typeof record.isolationKey !== 'string'
+    || (record.endpointRef !== undefined && typeof record.endpointRef !== 'string')
+    || (record.secretRef !== undefined && typeof record.secretRef !== 'string')
+  ) {
+    return invalidPreparedRun();
+  }
+  return {
+    canvasAgentBindingId: record.canvasAgentBindingId,
+    agentId: record.agentId,
+    runtimeKind: record.runtimeKind,
+    isolationKey: record.isolationKey,
+    ...(record.endpointRef === undefined ? {} : { endpointRef: record.endpointRef }),
+    ...(record.secretRef === undefined ? {} : { secretRef: record.secretRef }),
+  };
+}
+
+function parsePreparedRunToolPolicy(value: unknown): RuntimeToolPolicySnapshot {
+  const record = plainRecord(value);
+  if (!record || !hasExactKeys(record, [
+    'allowedToolKeys',
+    'deniedToolKeys',
+    'approvalRequiredToolKeys',
+  ])) {
+    return invalidPreparedRun();
+  }
+  try {
+    return runtimeToolPolicy(record);
+  } catch {
+    return invalidPreparedRun();
+  }
+}
+
+function parseRuntimeContextSnapshots(value: unknown): RuntimeContextSnapshot[] {
+  if (!Array.isArray(value)) return invalidPreparedRun();
+  return value.map((item) => {
+    const record = plainRecord(item);
+    const provenance = record ? plainRecord(record.provenance) : null;
+    if (
+      !record
+      || !hasExactKeys(record, [
+        'canvasContextRefId',
+        'scope',
+        'visibility',
+        'content',
+        'provenance',
+      ])
+      || typeof record.canvasContextRefId !== 'string'
+      || !uuidPattern.test(record.canvasContextRefId)
+      || typeof record.scope !== 'string'
+      || !contextScopes.has(record.scope as RuntimeContextSnapshot['scope'])
+      || typeof record.visibility !== 'string'
+      || !contextVisibilities.has(
+        record.visibility as RuntimeContextSnapshot['visibility'],
+      )
+      || !provenance
+    ) {
+      return invalidPreparedRun();
+    }
+    return {
+      canvasContextRefId: record.canvasContextRefId,
+      scope: record.scope as RuntimeContextSnapshot['scope'],
+      visibility: record.visibility as RuntimeContextSnapshot['visibility'],
+      content: record.content,
+      provenance: { ...provenance },
+    };
+  });
+}
+
+function canonicalValuesEqual(left: unknown, right: unknown): boolean {
+  try {
+    return toCanonicalPayload(left).bytes.equals(toCanonicalPayload(right).bytes);
+  } catch {
+    return false;
+  }
+}
+
+function parsePreparedRunReplay(
+  receipt: RunCommandReceiptRow,
+  row: PreparedRunReplayRow,
+  input: PrepareRunInput,
+  workflowId: string,
+): PreparedRun {
+  const record = plainRecord(receipt.result_payload);
+  const prompt = record ? plainRecord(record.prompt) : null;
+  const runtime = record ? plainRecord(record.runtime) : null;
+  if (
+    receipt.command_type !== 'start-run'
+    || receipt.account_id !== input.actor.accountId
+    || receipt.result_type !== 'run'
+    || receipt.result_id === null
+    || !record
+    || !hasExactKeys(record, [
+      'commandReceiptId',
+      'phase',
+      'workflowId',
+      'sessionId',
+      'runId',
+      'status',
+      'prompt',
+      'runtime',
+    ])
+    || record.commandReceiptId !== receipt.id
+    || record.workflowId !== workflowId
+    || record.sessionId !== input.sessionId
+    || record.runId !== receipt.result_id
+    || typeof record.phase !== 'string'
+    || !orchestrationPhases.has(record.phase as PreparedRun['phase'])
+    || typeof record.status !== 'string'
+    || !storedRunStatuses.has(record.status as StoredRunStatus)
+    || !prompt
+    || !hasExactKeys(prompt, ['canvasMessageId', 'role', 'content'])
+    || typeof prompt.canvasMessageId !== 'string'
+    || !uuidPattern.test(prompt.canvasMessageId)
+    || prompt.role !== 'user'
+    || typeof prompt.content !== 'string'
+    || !runtime
+    || !hasExactKeys(runtime, [
+      'binding',
+      'externalSessionRef',
+      'expectedHistoryDigest',
+      'model',
+      'toolPolicy',
+      'context',
+    ])
+    || typeof runtime.externalSessionRef !== 'string'
+    || typeof runtime.expectedHistoryDigest !== 'string'
+  ) {
+    return invalidPreparedRun();
+  }
+
+  const binding = parseRuntimeBindingSnapshot(runtime.binding);
+  const model = parseRuntimeModelSnapshot(runtime.model);
+  const toolPolicy = parsePreparedRunToolPolicy(runtime.toolPolicy);
+  const context = parseRuntimeContextSnapshots(runtime.context);
+  const storedModel = parseRuntimeModelSnapshot(row.model_snapshot);
+  const storedToolPolicy = parsePreparedRunToolPolicy(row.tool_policy_snapshot);
+  const storedContext = parseRuntimeContextSnapshots(row.context_policy_snapshot);
+  if (
+    row.run_id !== receipt.result_id
+    || row.session_id !== input.sessionId
+    || row.workflow_id !== workflowId
+    || row.message_id !== row.trigger_message_id
+    || row.message_id !== prompt.canvasMessageId
+    || row.message_session_id !== row.session_id
+    || row.message_workflow_id !== row.workflow_id
+    || row.message_role !== 'user'
+    || row.message_content !== prompt.content
+    || prompt.content !== input.content
+    || row.agent_binding_id !== binding.canvasAgentBindingId
+    || !canonicalValuesEqual(model, storedModel)
+    || !canonicalValuesEqual(toolPolicy, storedToolPolicy)
+    || !canonicalValuesEqual(context, storedContext)
+  ) {
+    return invalidPreparedRun();
+  }
+  return {
+    commandReceiptId: receipt.id,
+    phase: receipt.orchestration_phase,
+    workflowId,
+    sessionId: row.session_id,
+    runId: row.run_id,
+    status: row.status,
+    prompt: {
+      canvasMessageId: row.message_id,
+      role: 'user',
+      content: prompt.content,
+    },
+    runtime: {
+      binding,
+      externalSessionRef: runtime.externalSessionRef,
+      expectedHistoryDigest: runtime.expectedHistoryDigest,
+      model: storedModel,
+      toolPolicy: storedToolPolicy,
+      context: storedContext,
+    },
   };
 }
 
@@ -1496,9 +1787,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         )
         ON CONFLICT (workflow_id, command_key) DO NOTHING
       `;
-      const [receipt] = await tx<CommandReceiptRow[]>`
-        SELECT id, payload_hash, payload_canonical, orchestration_phase,
-          result_type, result_id, result_payload
+      const [receipt] = await tx<RunCommandReceiptRow[]>`
+        SELECT id, account_id, command_type, payload_hash, payload_canonical,
+          orchestration_phase, result_type, result_id, result_payload,
+          result_payload IS NOT NULL AS has_result_payload
         FROM command_receipts
         WHERE workflow_id = ${authorization.workflow_id}
           AND command_key = ${input.commandId}
@@ -1508,43 +1800,46 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (!exactCommandPayloadMatches(receipt, payload)) {
         throw new CommandPayloadConflictError(input.commandId);
       }
-      if (receipt.result_payload !== null) {
-        const value = receipt.result_payload;
-        const record = value !== null && typeof value === 'object' && !Array.isArray(value)
-          ? value as Record<string, unknown>
-          : null;
+      if (
+        receipt.command_type !== 'start-run'
+        || receipt.account_id !== input.actor.accountId
+      ) {
+        return invalidPreparedRun();
+      }
+      if (receipt.has_result_payload) {
         if (
           receipt.result_type !== 'run'
           || receipt.result_id === null
-          || record === null
-          || record.commandReceiptId !== receipt.id
-          || record.workflowId !== authorization.workflow_id
-          || record.sessionId !== input.sessionId
-          || record.runId !== receipt.result_id
-          || record.prompt === null
-          || typeof record.prompt !== 'object'
-          || Array.isArray(record.prompt)
-          || record.runtime === null
-          || typeof record.runtime !== 'object'
-          || Array.isArray(record.runtime)
         ) {
-          throw new Error('Invalid persisted Run command result payload');
+          return invalidPreparedRun();
         }
-        const [run] = await tx<{ status: StoredRunStatus }[]>`
-          SELECT status::text AS status
-          FROM runs
-          WHERE id = ${receipt.result_id} AND session_id = ${input.sessionId}
+        const [run] = await tx<PreparedRunReplayRow[]>`
+          SELECT run.id AS run_id, run.status::text AS status,
+            run.session_id, run.agent_binding_id, run.trigger_message_id,
+            run.model_snapshot, run.tool_policy_snapshot, run.context_policy_snapshot,
+            session.workflow_id, message.id AS message_id,
+            message.session_id AS message_session_id,
+            message.workflow_id AS message_workflow_id,
+            message.role::text AS message_role, message.content AS message_content
+          FROM runs run
+          JOIN sessions session ON session.id = run.session_id
+          JOIN messages message
+            ON message.id = run.trigger_message_id
+           AND message.session_id = run.session_id
+           AND message.workflow_id = session.workflow_id
+          WHERE run.id = ${receipt.result_id}
+            AND run.session_id = ${input.sessionId}
         `;
         if (!run) throw new Error('Invalid persisted Run result DB identity');
-        return {
-          ...(record as unknown as PreparedRun),
-          commandReceiptId: receipt.id,
-          phase: receipt.orchestration_phase,
-          workflowId: authorization.workflow_id,
-          sessionId: input.sessionId,
-          runId: receipt.result_id,
-          status: run.status,
-        };
+        return parsePreparedRunReplay(
+          receipt,
+          run,
+          input,
+          authorization.workflow_id,
+        );
+      }
+      if (receipt.result_type !== null || receipt.result_id !== null) {
+        return invalidPreparedRun();
       }
 
       const [session] = await tx<PrepareRunSessionRow[]>`
