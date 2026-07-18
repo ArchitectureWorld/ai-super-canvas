@@ -35,14 +35,16 @@ import {
   type TranscriptMessage,
   type UpdateSessionConfigInput,
 } from './control-plane-repository';
-import type {
-  PreparedRun,
-  PrepareRunInput,
-  RuntimeBindingSnapshot,
-  RuntimeContextSnapshot,
-  RuntimeModelSnapshot,
-  RuntimeToolPolicySnapshot,
-  StoredRunStatus,
+import {
+  ActiveRunConflictError,
+  RunIdempotencyConflictError,
+  type PreparedRun,
+  type PrepareRunInput,
+  type RuntimeBindingSnapshot,
+  type RuntimeContextSnapshot,
+  type RuntimeModelSnapshot,
+  type RuntimeToolPolicySnapshot,
+  type StoredRunStatus,
 } from './control-plane-run-types';
 
 interface CanonicalPayload {
@@ -107,6 +109,13 @@ interface RuntimeContextRow {
   provenance: Record<string, unknown>;
 }
 
+interface AuthorizedContextSelector {
+  accountId: string;
+  agentId: string;
+  workflowId: string;
+  sessionId: string;
+}
+
 interface PreparedRunReplayRow {
   run_id: string;
   status: StoredRunStatus;
@@ -122,6 +131,13 @@ interface PreparedRunReplayRow {
   message_workflow_id: string;
   message_role: string;
   message_content: unknown;
+  binding_agent_id: string;
+  binding_runtime_kind: string;
+  binding_isolation_key: string;
+  binding_endpoint_ref: string | null;
+  binding_secret_ref: string | null;
+  external_session_ref: string;
+  expected_history_digest: string | null;
 }
 
 interface StoredModelRow {
@@ -298,6 +314,57 @@ function runtimeToolPolicy(
   };
 }
 
+async function loadAuthorizedContextRows(
+  tx: postgres.TransactionSql,
+  selector: AuthorizedContextSelector,
+): Promise<RuntimeContextRow[]> {
+  return tx<RuntimeContextRow[]>`
+    SELECT id, scope::text AS scope, visibility::text AS visibility,
+      source_kind, source_ref, snapshot, provenance
+    FROM (
+      SELECT id, scope, visibility, source_kind, source_ref,
+        snapshot, provenance, created_at
+      FROM context_refs
+      WHERE scope = 'account'
+        AND visibility = 'private'
+        AND account_id = ${selector.accountId}
+        AND (expires_at IS NULL OR expires_at > now())
+      UNION ALL
+      SELECT id, scope, visibility, source_kind, source_ref,
+        snapshot, provenance, created_at
+      FROM context_refs
+      WHERE scope = 'agent'
+        AND visibility = 'private'
+        AND agent_id = ${selector.agentId}
+        AND account_id = ${selector.accountId}
+        AND (expires_at IS NULL OR expires_at > now())
+      UNION ALL
+      SELECT id, scope, visibility, source_kind, source_ref,
+        snapshot, provenance, created_at
+      FROM context_refs
+      WHERE scope = 'workflow'
+        AND workflow_id = ${selector.workflowId}
+        AND (
+          visibility = 'workspace'
+          OR (visibility = 'private' AND account_id = ${selector.accountId})
+        )
+        AND (expires_at IS NULL OR expires_at > now())
+      UNION ALL
+      SELECT id, scope, visibility, source_kind, source_ref,
+        snapshot, provenance, created_at
+      FROM context_refs
+      WHERE scope = 'session'
+        AND session_id = ${selector.sessionId}
+        AND (
+          visibility = 'workspace'
+          OR (visibility = 'private' AND account_id = ${selector.accountId})
+        )
+        AND (expires_at IS NULL OR expires_at > now())
+    ) authorized_contexts
+    ORDER BY created_at, id
+  `;
+}
+
 const storedRunStatuses = new Set<StoredRunStatus>([
   'queued',
   'running',
@@ -459,6 +526,38 @@ function canonicalValuesEqual(left: unknown, right: unknown): boolean {
   }
 }
 
+function dispatchAuthorityMatches(
+  row: PreparedRunReplayRow,
+  binding: RuntimeBindingSnapshot,
+  externalSessionRef: string,
+  expectedHistoryDigest: string,
+): boolean {
+  return binding.canvasAgentBindingId === row.agent_binding_id
+    && binding.agentId === row.binding_agent_id
+    && binding.runtimeKind === row.binding_runtime_kind
+    && binding.isolationKey === row.binding_isolation_key
+    && (binding.endpointRef ?? null) === row.binding_endpoint_ref
+    && (binding.secretRef ?? null) === row.binding_secret_ref
+    && externalSessionRef === row.external_session_ref
+    && expectedHistoryDigest === row.expected_history_digest;
+}
+
+function mapRunConstraintError(
+  error: unknown,
+  input: PrepareRunInput,
+): unknown {
+  if (!(error instanceof postgres.PostgresError) || error.code !== '23505') {
+    return error;
+  }
+  if (error.constraint_name === 'runs_one_active_per_session') {
+    return new ActiveRunConflictError(input.sessionId);
+  }
+  if (error.constraint_name === 'runs_session_idempotency_unique') {
+    return new RunIdempotencyConflictError(input.idempotencyKey);
+  }
+  return error;
+}
+
 function parsePreparedRunReplay(
   receipt: RunCommandReceiptRow,
   row: PreparedRunReplayRow,
@@ -531,7 +630,12 @@ function parsePreparedRunReplay(
     || row.message_role !== 'user'
     || row.message_content !== prompt.content
     || prompt.content !== input.content
-    || row.agent_binding_id !== binding.canvasAgentBindingId
+    || !dispatchAuthorityMatches(
+      row,
+      binding,
+      runtime.externalSessionRef,
+      runtime.expectedHistoryDigest,
+    )
     || !canonicalValuesEqual(model, storedModel)
     || !canonicalValuesEqual(toolPolicy, storedToolPolicy)
     || !canonicalValuesEqual(context, storedContext)
@@ -1820,9 +1924,22 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
             session.workflow_id, message.id AS message_id,
             message.session_id AS message_session_id,
             message.workflow_id AS message_workflow_id,
-            message.role::text AS message_role, message.content AS message_content
+            message.role::text AS message_role, message.content AS message_content,
+            binding.agent_id AS binding_agent_id,
+            binding.runtime_kind::text AS binding_runtime_kind,
+            binding.isolation_key AS binding_isolation_key,
+            binding.endpoint_ref AS binding_endpoint_ref,
+            binding.secret_ref AS binding_secret_ref,
+            runtime_ref.external_session_ref,
+            runtime_ref.metadata ->> 'historyDigest' AS expected_history_digest
           FROM runs run
           JOIN sessions session ON session.id = run.session_id
+          JOIN agent_bindings binding ON binding.id = run.agent_binding_id
+          JOIN session_runtime_refs runtime_ref
+            ON runtime_ref.session_id = run.session_id
+           AND runtime_ref.agent_binding_id = run.agent_binding_id
+           AND runtime_ref.is_primary = true
+           AND runtime_ref.status = 'active'
           JOIN messages message
             ON message.id = run.trigger_message_id
            AND message.session_id = run.session_id
@@ -1864,29 +1981,36 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         throw new Error('Session Runtime reference has no history digest');
       }
 
+      const [idempotentRun] = await tx<{ id: string }[]>`
+        SELECT id FROM runs
+        WHERE session_id = ${input.sessionId}
+          AND idempotency_key = ${input.idempotencyKey}
+      `;
+      if (idempotentRun) {
+        throw new RunIdempotencyConflictError(input.idempotencyKey);
+      }
+      const [activeRun] = await tx<{ id: string }[]>`
+        SELECT id FROM runs
+        WHERE session_id = ${input.sessionId}
+          AND status IN ('queued', 'running', 'waiting_approval', 'reconciling')
+        LIMIT 1
+      `;
+      if (activeRun) {
+        throw new ActiveRunConflictError(input.sessionId);
+      }
+
       const config = await this.loadConfig(tx, input.sessionId);
       const model = {
         providerKey: config.model.providerKey,
         modelKey: config.model.modelKey,
       };
       const toolPolicy = runtimeToolPolicy(config.toolPolicy);
-      const contextRows = await tx<RuntimeContextRow[]>`
-        SELECT id, scope::text AS scope, visibility::text AS visibility,
-          source_kind, source_ref, snapshot, provenance
-        FROM context_refs
-        WHERE (expires_at IS NULL OR expires_at > now())
-          AND (
-            (visibility = 'private' AND account_id = ${input.actor.accountId})
-            OR visibility = 'workspace'
-          )
-          AND (
-            (scope = 'account' AND account_id = ${input.actor.accountId})
-            OR (scope = 'agent' AND agent_id = ${authorization.agent_id})
-            OR (scope = 'workflow' AND workflow_id = ${authorization.workflow_id})
-            OR (scope = 'session' AND session_id = ${input.sessionId})
-          )
-        ORDER BY created_at, id
-      `;
+      const contextRows = await loadAuthorizedContextRows(tx, {
+        accountId: input.actor.accountId,
+        agentId: authorization.agent_id,
+        workflowId: authorization.workflow_id,
+        sessionId: input.sessionId,
+      });
       const context: RuntimeContextSnapshot[] = contextRows.map((row) => ({
         canvasContextRefId: row.id,
         scope: row.scope,
@@ -1899,14 +2023,6 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         },
       }));
 
-      const [idempotentRun] = await tx<{ id: string }[]>`
-        SELECT id FROM runs
-        WHERE session_id = ${input.sessionId}
-          AND idempotency_key = ${input.idempotencyKey}
-      `;
-      if (idempotentRun) {
-        throw new Error(`Run idempotency conflict for ${input.idempotencyKey}`);
-      }
       const [nextMessage] = await tx<{ ordinal: number }[]>`
         SELECT (COALESCE(MAX(ordinal), -1) + 1)::integer AS ordinal
         FROM messages
@@ -1980,6 +2096,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         WHERE id = ${receipt.id}
       `;
       return result;
+    }).catch((error: unknown) => {
+      throw mapRunConstraintError(error, input);
     });
   }
 
@@ -2758,31 +2876,12 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         WHERE session.id = ${input.sessionId}
       `;
       if (!row) throw new AuthorizationError();
-      const contextRows = await tx<{
-        id: string;
-        scope: string;
-        visibility: string;
-        source_kind: string;
-        source_ref: string;
-        snapshot: unknown;
-        provenance: Record<string, unknown>;
-      }[]>`
-        SELECT id, scope::text AS scope, visibility::text AS visibility,
-          source_kind, source_ref, snapshot, provenance
-        FROM context_refs
-        WHERE (expires_at IS NULL OR expires_at > now())
-          AND (
-            (visibility = 'private' AND account_id = ${input.actor.accountId})
-            OR visibility = 'workspace'
-          )
-          AND (
-            (scope = 'account' AND account_id = ${input.actor.accountId})
-            OR (scope = 'agent' AND agent_id = ${row.agent_id})
-            OR (scope = 'workflow' AND workflow_id = ${row.workflow_id})
-            OR (scope = 'session' AND session_id = ${input.sessionId})
-          )
-        ORDER BY created_at, id
-      `;
+      const contextRows = await loadAuthorizedContextRows(tx, {
+        accountId: input.actor.accountId,
+        agentId: row.agent_id,
+        workflowId: row.workflow_id,
+        sessionId: input.sessionId,
+      });
       const historyDigest = row.runtime_metadata?.historyDigest;
       return {
         sessionId: input.sessionId,

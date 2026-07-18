@@ -1443,4 +1443,75 @@ describe('S1 PostgreSQL schema invariants', () => {
       }),
     ).rejects.toThrow();
   });
+
+  it('installs usable scope-specific indexes for authorized ContextRef loading', async () => {
+    const expectedIndexes = [
+      'context_refs_account_authorized_idx',
+      'context_refs_agent_authorized_idx',
+      'context_refs_session_authorized_idx',
+      'context_refs_workflow_authorized_idx',
+    ];
+    const indexes = await sql<{ indexname: string }[]>`
+      SELECT indexname
+      FROM pg_indexes
+      WHERE schemaname = 'public'
+        AND tablename = 'context_refs'
+        AND indexname = ANY(${expectedIndexes})
+      ORDER BY indexname
+    `;
+    expect(indexes.map((index) => index.indexname)).toEqual(expectedIndexes);
+
+    const actorId = randomUUID();
+    const agentId = randomUUID();
+    const workflowId = randomUUID();
+    const sessionId = randomUUID();
+    const plan = await sql.begin(async (tx) => {
+      await tx`SET LOCAL enable_seqscan = off`;
+      return tx<{ 'QUERY PLAN': unknown }[]>`
+        EXPLAIN (FORMAT JSON)
+        SELECT id
+        FROM (
+          SELECT id, created_at
+          FROM context_refs
+          WHERE scope = 'account'
+            AND visibility = 'private'
+            AND account_id = ${actorId}
+            AND (expires_at IS NULL OR expires_at > now())
+          UNION ALL
+          SELECT id, created_at
+          FROM context_refs
+          WHERE scope = 'agent'
+            AND visibility = 'private'
+            AND agent_id = ${agentId}
+            AND account_id = ${actorId}
+            AND (expires_at IS NULL OR expires_at > now())
+          UNION ALL
+          SELECT id, created_at
+          FROM context_refs
+          WHERE scope = 'workflow'
+            AND workflow_id = ${workflowId}
+            AND (
+              visibility = 'workspace'
+              OR (visibility = 'private' AND account_id = ${actorId})
+            )
+            AND (expires_at IS NULL OR expires_at > now())
+          UNION ALL
+          SELECT id, created_at
+          FROM context_refs
+          WHERE scope = 'session'
+            AND session_id = ${sessionId}
+            AND (
+              visibility = 'workspace'
+              OR (visibility = 'private' AND account_id = ${actorId})
+            )
+            AND (expires_at IS NULL OR expires_at > now())
+        ) authorized_contexts
+        ORDER BY created_at, id
+      `;
+    });
+    const serializedPlan = JSON.stringify(plan);
+    for (const indexName of expectedIndexes) {
+      expect(serializedPlan).toContain(indexName);
+    }
+  });
 });

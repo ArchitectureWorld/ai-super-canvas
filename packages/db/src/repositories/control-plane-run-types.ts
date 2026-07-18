@@ -2,6 +2,24 @@ import type { ActorContext } from '@ai-super-canvas/core';
 
 import type { OrchestrationPhase, StoredMessage } from './control-plane-repository';
 
+export class ActiveRunConflictError extends Error {
+  readonly code = 'active_run_conflict' as const;
+
+  constructor(sessionId: string) {
+    super(`Session ${sessionId} already has an active Run`);
+    this.name = 'ActiveRunConflictError';
+  }
+}
+
+export class RunIdempotencyConflictError extends Error {
+  readonly code = 'run_idempotency_conflict' as const;
+
+  constructor(idempotencyKey: string) {
+    super(`Run idempotency conflict for ${idempotencyKey}`);
+    this.name = 'RunIdempotencyConflictError';
+  }
+}
+
 export type StoredRunStatus =
   | 'queued'
   | 'running'

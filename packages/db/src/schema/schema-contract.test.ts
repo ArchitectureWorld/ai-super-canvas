@@ -112,4 +112,17 @@ describe('control-plane schema exports', () => {
     expect(foreignKeyNames).toContain('session_config_model_entry_fk');
     expect(foreignKeyNames.every((name) => name.length <= 63)).toBe(true);
   });
+
+  it('declares scope-specific indexes for authorized ContextRef loading', () => {
+    const indexNames = getTableConfig(contextRefs).indexes
+      .map((index) => index.config.name)
+      .sort();
+
+    expect(indexNames).toEqual([
+      'context_refs_account_authorized_idx',
+      'context_refs_agent_authorized_idx',
+      'context_refs_session_authorized_idx',
+      'context_refs_workflow_authorized_idx',
+    ]);
+  });
 });

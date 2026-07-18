@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm';
 import {
   check,
   foreignKey,
+  index,
   jsonb,
   pgTable,
   text,
@@ -188,5 +189,37 @@ export const contextRefs = pgTable(
       columns: [table.sessionId, table.runId],
       foreignColumns: [runs.sessionId, runs.id],
     }),
+    index('context_refs_account_authorized_idx')
+      .on(table.accountId, table.expiresAt, table.createdAt, table.id)
+      .where(sql`${table.scope} = 'account' AND ${table.visibility} = 'private'`),
+    index('context_refs_agent_authorized_idx')
+      .on(
+        table.agentId,
+        table.accountId,
+        table.expiresAt,
+        table.createdAt,
+        table.id,
+      )
+      .where(sql`${table.scope} = 'agent' AND ${table.visibility} = 'private'`),
+    index('context_refs_workflow_authorized_idx')
+      .on(
+        table.workflowId,
+        table.visibility,
+        table.accountId,
+        table.expiresAt,
+        table.createdAt,
+        table.id,
+      )
+      .where(sql`${table.scope} = 'workflow'`),
+    index('context_refs_session_authorized_idx')
+      .on(
+        table.sessionId,
+        table.visibility,
+        table.accountId,
+        table.expiresAt,
+        table.createdAt,
+        table.id,
+      )
+      .where(sql`${table.scope} = 'session'`),
   ],
 );

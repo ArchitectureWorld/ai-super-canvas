@@ -36,6 +36,13 @@
       "when": 1784260283681,
       "tag": "0004_s1_invariant_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1784374958761,
+      "tag": "0005_prepared_run_invariants",
+      "breakpoints": true
     }
   ]
 }

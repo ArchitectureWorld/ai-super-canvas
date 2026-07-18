@@ -2173,13 +2173,16 @@ describe('PostgresControlPlaneRepository', () => {
         content: '同一个 commandId 的不同内容',
       }),
     ).rejects.toThrow(/payload conflict/i);
-    await expect(
-      repository.prepareRun({
-        ...input,
-        commandId: '12121212-1212-4212-8212-121212121212',
-        content: '同一个 idempotencyKey 的不同命令',
-      }),
-    ).rejects.toThrow(/idempotency/i);
+    const idempotencyError = await repository.prepareRun({
+      ...input,
+      commandId: '12121212-1212-4212-8212-121212121212',
+      content: '同一个 idempotencyKey 的不同命令',
+    }).then(() => null, (reason: unknown) => reason);
+    expect(idempotencyError).toMatchObject({
+      name: 'RunIdempotencyConflictError',
+      code: 'run_idempotency_conflict',
+      message: `Run idempotency conflict for ${input.idempotencyKey}`,
+    });
 
     const [counts] = await sql<{
       messages: number;
@@ -2205,6 +2208,248 @@ describe('PostgresControlPlaneRepository', () => {
       receipts: 1,
       start_run_receipts: 1,
     });
+  });
+
+  it('rejects a second active Run with a stable domain error and no new state', async () => {
+    const fixture = await bootstrapFixture();
+    const session = await repository.createRootSession({
+      actor: fixture.actor,
+      commandId: '45454545-1010-4010-8010-101010101010',
+      workflowId: fixture.workflowId,
+      agentBindingId: fixture.agentBindingId,
+      title: 'Active Run conflict Session',
+    });
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: 'fake-session-active-run-conflict',
+    });
+    await repository.attachRuntimeSession({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      runtimeSession: {
+        externalSessionRef: 'fake-session-active-run-conflict',
+        runtimeVersion: 'deterministic-v1',
+        replayStatus: 'complete',
+        historyDigest: 'active-run-conflict-history',
+        metadata: {},
+      },
+    });
+    await repository.prepareRun({
+      actor: fixture.actor,
+      commandId: '46464646-1010-4010-8010-101010101010',
+      idempotencyKey: 'first-active-run',
+      sessionId: session.sessionId,
+      content: 'Keep this Run queued',
+    });
+    const countState = async () => {
+      const [counts] = await sql<{
+        messages: number;
+        runs: number;
+        receipts: number;
+      }[]>`
+        SELECT
+          (SELECT count(*)::integer FROM messages
+            WHERE session_id = ${session.sessionId}) AS messages,
+          (SELECT count(*)::integer FROM runs
+            WHERE session_id = ${session.sessionId}) AS runs,
+          (SELECT count(*)::integer FROM command_receipts
+            WHERE workflow_id = ${fixture.workflowId}
+              AND command_type = 'start-run') AS receipts
+      `;
+      return counts;
+    };
+    const before = await countState();
+
+    const error = await repository.prepareRun({
+      actor: fixture.actor,
+      commandId: '47474747-1010-4010-8010-101010101010',
+      idempotencyKey: 'second-active-run',
+      sessionId: session.sessionId,
+      content: 'This Run must not be created',
+    }).then(() => null, (reason: unknown) => reason);
+
+    expect(error).toMatchObject({
+      name: 'ActiveRunConflictError',
+      code: 'active_run_conflict',
+      message: `Session ${session.sessionId} already has an active Run`,
+    });
+    expect(await countState()).toEqual(before);
+  });
+
+  it('maps Run unique-constraint races to stable domain errors', async () => {
+    const fixture = await bootstrapFixture();
+    const session = await repository.createRootSession({
+      actor: fixture.actor,
+      commandId: '48484848-1010-4010-8010-101010101010',
+      workflowId: fixture.workflowId,
+      agentBindingId: fixture.agentBindingId,
+      title: 'Active Run race Session',
+    });
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: 'fake-session-active-run-race',
+    });
+    await repository.attachRuntimeSession({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      runtimeSession: {
+        externalSessionRef: 'fake-session-active-run-race',
+        runtimeVersion: 'deterministic-v1',
+        replayStatus: 'complete',
+        historyDigest: 'active-run-race-history',
+        metadata: {},
+      },
+    });
+    const dormantMessageId = '49494949-1010-4010-8010-101010101010';
+    const dormantRunId = '50505050-1010-4010-8010-101010101010';
+    const [config] = await sql<{ id: string }[]>`
+      SELECT id FROM session_config_revisions
+      WHERE session_id = ${session.sessionId}
+      ORDER BY version DESC
+      LIMIT 1
+    `;
+    if (!config) throw new Error('Active Run race config fixture is missing');
+    await sql`
+      INSERT INTO messages (
+        id, workflow_id, session_id, ordinal, role,
+        actor_account_id, content, status
+      ) VALUES (
+        ${dormantMessageId}, ${fixture.workflowId}, ${session.sessionId}, 0,
+        'user', ${fixture.accountId}, ${sql.json('Dormant race Run')}, 'completed'
+      )
+    `;
+    await sql`
+      INSERT INTO runs (
+        id, session_id, agent_binding_id, config_revision_id,
+        trigger_message_id, idempotency_key, status,
+        model_snapshot, tool_policy_snapshot, context_policy_snapshot
+      ) VALUES (
+        ${dormantRunId}, ${session.sessionId}, ${fixture.agentBindingId}, ${config.id},
+        ${dormantMessageId}, 'dormant-race-run', 'failed',
+        ${sql.json({ providerKey: 'fake', modelKey: 'deterministic-v1' })},
+        ${sql.json({
+          allowedToolKeys: [],
+          deniedToolKeys: [],
+          approvalRequiredToolKeys: [],
+        })}, '[]'::jsonb
+      )
+    `;
+
+    const lockKey = 8_675_309;
+    const lockSql = postgres(databaseUrl, { max: 1 });
+    await sql.unsafe(`
+      CREATE FUNCTION test_wait_before_run_message()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $function$
+      BEGIN
+        IF NEW.content IN (
+          to_jsonb('Force active Run fallback'::text),
+          to_jsonb('Force idempotency fallback'::text)
+        ) THEN
+          PERFORM pg_advisory_xact_lock(${lockKey});
+        END IF;
+        RETURN NEW;
+      END;
+      $function$;
+      CREATE TRIGGER test_wait_before_run_message
+      BEFORE INSERT ON messages
+      FOR EACH ROW
+      EXECUTE FUNCTION test_wait_before_run_message();
+    `);
+    const forceConstraintRace = async (
+      commandId: string,
+      idempotencyKey: string,
+      content: string,
+      createConflict: () => Promise<unknown>,
+    ) => {
+      let released = false;
+      let pending: Promise<unknown> | null = null;
+      await lockSql`SELECT pg_advisory_lock(${lockKey})`;
+      pending = repository.prepareRun({
+        actor: fixture.actor,
+        commandId,
+        idempotencyKey,
+        sessionId: session.sessionId,
+        content,
+      }).then(() => null, (reason: unknown) => reason);
+      try {
+        let waitingForAdvisoryLock = false;
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          const [waiting] = await sql<{ found: boolean }[]>`
+            SELECT EXISTS (
+              SELECT 1 FROM pg_locks
+              WHERE locktype = 'advisory' AND granted = false
+            ) AS found
+          `;
+          waitingForAdvisoryLock = waiting?.found ?? false;
+          if (waitingForAdvisoryLock) break;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        if (waitingForAdvisoryLock) await createConflict();
+        await lockSql`SELECT pg_advisory_unlock(${lockKey})`;
+        released = true;
+        return {
+          error: await pending,
+          waitingForAdvisoryLock,
+        };
+      } finally {
+        if (!released) await lockSql`SELECT pg_advisory_unlock(${lockKey})`;
+        await pending;
+      }
+    };
+    try {
+      const activeRace = await forceConstraintRace(
+        '51515151-1010-4010-8010-101010101010',
+        'active-run-fallback',
+        'Force active Run fallback',
+        () => sql`UPDATE runs SET status = 'queued' WHERE id = ${dormantRunId}`,
+      );
+
+      expect(activeRace.waitingForAdvisoryLock).toBe(true);
+      expect(activeRace.error).toMatchObject({
+        name: 'ActiveRunConflictError',
+        code: 'active_run_conflict',
+        message: `Session ${session.sessionId} already has an active Run`,
+      });
+      await sql`UPDATE runs SET status = 'failed' WHERE id = ${dormantRunId}`;
+
+      const idempotencyRace = await forceConstraintRace(
+        '52525252-1010-4010-8010-101010101010',
+        'idempotency-fallback',
+        'Force idempotency fallback',
+        () => sql`
+          UPDATE runs
+          SET idempotency_key = 'idempotency-fallback'
+          WHERE id = ${dormantRunId}
+        `,
+      );
+
+      expect(idempotencyRace.waitingForAdvisoryLock).toBe(true);
+      expect(idempotencyRace.error).toMatchObject({
+        name: 'RunIdempotencyConflictError',
+        code: 'run_idempotency_conflict',
+        message: 'Run idempotency conflict for idempotency-fallback',
+      });
+    } finally {
+      await lockSql.end();
+      await sql.unsafe(`
+        DROP TRIGGER IF EXISTS test_wait_before_run_message ON messages;
+        DROP FUNCTION IF EXISTS test_wait_before_run_message();
+      `);
+    }
   });
 
   it('rejects malformed stored Runtime tool policies without leaving Run state', async () => {
@@ -2362,6 +2607,68 @@ describe('PostgresControlPlaneRepository', () => {
       WHERE id = ${first.commandReceiptId}
     `;
     if (!sourceReceipt) throw new Error('Prepared Run receipt fixture is missing');
+    const authoritativeTampering = [
+      {
+        receiptId: '39393939-1010-4010-8010-101010101010',
+        commandId: '40404040-1010-4010-8010-101010101010',
+        field: 'isolationKey',
+        value: 'tampered-isolation-key',
+      },
+      {
+        receiptId: '41414141-1010-4010-8010-101010101010',
+        commandId: '42424242-1010-4010-8010-101010101010',
+        field: 'externalSessionRef',
+        value: 'tampered-external-session-ref',
+      },
+      {
+        receiptId: '43434343-1010-4010-8010-101010101010',
+        commandId: '44444444-1010-4010-8010-101010101010',
+        field: 'expectedHistoryDigest',
+        value: 'tampered-history-digest',
+      },
+    ] as const;
+    const tamperingResults: unknown[] = [];
+    for (const tampering of authoritativeTampering) {
+      const runtime = tampering.field === 'isolationKey'
+        ? {
+            ...first.runtime,
+            binding: {
+              ...first.runtime.binding,
+              isolationKey: tampering.value,
+            },
+          }
+        : {
+            ...first.runtime,
+            [tampering.field]: tampering.value,
+          };
+      await sql`
+        INSERT INTO command_receipts (
+          id, workflow_id, account_id, command_key, command_type,
+          payload_hash, payload_canonical, orchestration_phase,
+          result_type, result_id, result_payload
+        ) VALUES (
+          ${tampering.receiptId}, ${fixture.workflowId}, ${fixture.accountId},
+          ${tampering.commandId}, 'start-run', ${sourceReceipt.payload_hash},
+          ${sourceReceipt.payload_canonical}, 'runtime_dispatched', 'run', ${first.runId},
+          ${sql.json({
+            ...first,
+            commandReceiptId: tampering.receiptId,
+            runtime,
+          } as unknown as postgres.JSONValue)}
+        )
+      `;
+      tamperingResults.push(await repository.prepareRun({
+        ...input,
+        commandId: tampering.commandId,
+      }).then(() => null, (reason: unknown) => reason));
+    }
+    for (const result of tamperingResults) {
+      expect(result).toBeInstanceOf(Error);
+      expect((result as Error).message).toMatch(
+        /invalid persisted Run command result payload/i,
+      );
+    }
+
     const corruptReceiptId = '18181818-1010-4010-8010-101010101010';
     const corruptCommandId = '19191919-1010-4010-8010-101010101010';
     await sql`

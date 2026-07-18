@@ -1,0 +1,4 @@
+CREATE INDEX "context_refs_account_authorized_idx" ON "context_refs" USING btree ("account_id","expires_at","created_at","id") WHERE "context_refs"."scope" = 'account' AND "context_refs"."visibility" = 'private';--> statement-breakpoint
+CREATE INDEX "context_refs_agent_authorized_idx" ON "context_refs" USING btree ("agent_id","account_id","expires_at","created_at","id") WHERE "context_refs"."scope" = 'agent' AND "context_refs"."visibility" = 'private';--> statement-breakpoint
+CREATE INDEX "context_refs_workflow_authorized_idx" ON "context_refs" USING btree ("workflow_id","visibility","account_id","expires_at","created_at","id") WHERE "context_refs"."scope" = 'workflow';--> statement-breakpoint
+CREATE INDEX "context_refs_session_authorized_idx" ON "context_refs" USING btree ("session_id","visibility","account_id","expires_at","created_at","id") WHERE "context_refs"."scope" = 'session';
