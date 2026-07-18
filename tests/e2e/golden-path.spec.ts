@@ -6,30 +6,41 @@ test('creates a branch from a text anchor and explicitly writes its conclusion b
   const pageErrors: Error[] = [];
   page.on('pageerror', (error) => pageErrors.push(error));
   await page.goto('/');
-  await page.evaluate(() => localStorage.removeItem('ai-super-canvas.gate-0.workspace.v1'));
-  await page.reload();
-
-  const trunk = page.getByLabel('主干文本');
-  await expect(trunk).toBeVisible();
-  await trunk.evaluate((element: HTMLTextAreaElement) => {
-    element.focus();
-    element.setSelectionRange(0, 6);
-    element.dispatchEvent(new Event('select', { bubbles: true }));
+  await page.evaluate(() => {
+    localStorage.removeItem('ai-super-canvas.gate-0.workspace.v1');
+    localStorage.removeItem('ai-super-canvas.gate-0.canvas-layout.v1');
   });
-  await page.getByRole('button', { name: '从选区创建分支' }).click();
-  await expect(page.getByRole('heading', { name: '围绕“从一个清晰的”的探索' })).toBeVisible();
+  await page.reload();
 
-  await page.getByLabel('分支消息').fill('先验证锚点、分支与回写是否构成可理解的工作流。');
-  await page.getByRole('button', { name: '写入分支' }).click();
-  await page.getByRole('button', { name: '生成演示结论卡' }).click();
-  await expect(page.getByRole('heading', { name: '建议：先完成可回写纵切' })).toBeVisible();
+  const trunk = page.getByRole('textbox', { name: '主干活文档' });
+  await expect(trunk).toBeVisible();
+  await trunk.click();
+  await page.keyboard.press('Control+A');
+  await page.getByRole('button', { name: '＋ 长出分支' }).click();
+  await expect(page.getByText(/分支：围绕“从一个清晰的问题开始/)).toBeVisible();
 
-  await page.getByRole('button', { name: '回写主干' }).click();
-  await expect(page.getByText('主干修订 2')).toBeVisible();
-  await expect(trunk).toContainText('先完成可回写纵切');
+  await page.getByLabel('AI Composer').fill('先验证锚点、分支与回写是否构成可理解的工作流。');
+  await page.getByRole('button', { name: '↑' }).click();
+  await expect(
+    page.getByText('先验证锚点、分支与回写是否构成可理解的工作流。', {
+      exact: true,
+    }).first(),
+  ).toBeVisible();
+  await page.getByRole('button', { name: '提炼成果' }).click();
+
+  await page.getByRole('button', { name: '预览 Diff · 滋养主干 →' }).click();
+  await page.getByRole('button', { name: '确认回写主干' }).click();
+  await expect(trunk).toHaveValue(/## 关于/);
+  const storedLayout = await page.evaluate(() => (
+    localStorage.getItem('ai-super-canvas.gate-0.canvas-layout.v1')
+  ));
+  expect(storedLayout).not.toBeNull();
+  expect(JSON.parse(storedLayout!).selectedNodeId).not.toBe('trunk');
 
   await page.reload();
-  await expect(page.getByText('主干修订 2')).toBeVisible();
-  await expect(page.getByLabel('主干文本')).toContainText('先完成可回写纵切');
+  await expect(page.getByRole('textbox', { name: '主干活文档' })).toHaveValue(/## 关于/);
+  await expect.poll(() => page.evaluate(() => (
+    localStorage.getItem('ai-super-canvas.gate-0.canvas-layout.v1')
+  ))).toBe(storedLayout);
   expect(pageErrors).toEqual([]);
 });

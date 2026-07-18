@@ -126,7 +126,8 @@ function nodeIdFromEventTarget(target: EventTarget): string | null {
 
 export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalog }) {
   const workspace = useSyncExternalStore(subscribeToWorkspace, getWorkspaceSnapshot, createDemoWorkspace);
-  const [layout, setLayout] = useState<CanvasLayoutState>(initialStoredCanvasLayout);
+  const [layout, setLayout] = useState<CanvasLayoutState>(initialCanvasLayout);
+  const [storedLayoutLoaded, setStoredLayoutLoaded] = useState(false);
   const [draftOverride, setDraftOverride] = useState<string | null>(null);
   const [branchMessage, setBranchMessage] = useState('');
   const [error, setError] = useState('');
@@ -149,6 +150,19 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
   const availableModelsKey = JSON.stringify(modelCatalog.models);
 
   useEffect(() => {
+    let isMounted = true;
+    queueMicrotask(() => {
+      if (isMounted) {
+        setLayout(initialStoredCanvasLayout());
+        setStoredLayoutLoaded(true);
+      }
+    });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
     const models = JSON.parse(availableModelsKey) as string[];
     let isCurrentCatalog = true;
     queueMicrotask(() => {
@@ -162,8 +176,9 @@ export function WorkspacePrototype({ modelCatalog }: { modelCatalog: ModelCatalo
   }, [availableModelsKey]);
 
   useEffect(() => {
+    if (!storedLayoutLoaded) return;
     window.localStorage.setItem(layoutStorageKey, JSON.stringify(layout));
-  }, [layout]);
+  }, [layout, storedLayoutLoaded]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
