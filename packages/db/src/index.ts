@@ -9,3 +9,6 @@ export function requireDatabaseUrl(
 
   return value;
 }
+
+export * from './repositories/control-plane-repository';
+export * from './repositories/postgres-control-plane-repository';
