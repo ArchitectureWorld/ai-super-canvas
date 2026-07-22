@@ -46,8 +46,8 @@ POSTGRES_PASSWORD=上一步生成的URL安全随机字符串
 POSTGRES_DB=canvas
 OPENAI_API_KEY=
 OPENAI_MODEL=
-AI_AVAILABLE_MODELS=gpt-5,gpt-5-mini,deepseek-chat
-AI_DEFAULT_MODEL=gpt-5
+AI_AVAILABLE_MODELS=deterministic-v1
+AI_DEFAULT_MODEL=deterministic-v1
 ```
 
 `AI_AVAILABLE_MODELS` 是画布块可选择模型的逗号分隔目录，`AI_DEFAULT_MODEL` 必须是其中一项。示例只声明模型名称；真实 provider secret 只写入部署主机的 `.env`，不得提交到 Git。

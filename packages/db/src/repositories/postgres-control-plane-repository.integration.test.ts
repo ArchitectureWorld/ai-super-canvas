@@ -1514,6 +1514,145 @@ describe('PostgresControlPlaneRepository', () => {
     ).rejects.toThrow(/lineage/i);
   });
 
+  it('continues fork ordinals through a normal Run completion before a grandchild fork', async () => {
+    const { fixture, session: root, prepared: rootRun } = await prepareRuntimeRun({
+      suffix: 'fork-ordinal-root',
+    });
+    await repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: rootRun.runId,
+      event: {
+        runtimeEventKey: 'fork-ordinal-root-completed',
+        eventType: 'run.completed',
+        payload: { status: 'succeeded' },
+        occurredAt: '2026-07-18T05:00:00.000Z',
+        message: {
+          role: 'assistant',
+          content: { text: 'Root completion for fork' },
+        },
+        terminal: { status: 'succeeded' },
+      },
+    });
+    const rootTranscript = await repository.loadSessionTranscript({
+      actor: fixture.actor,
+      sessionId: root.sessionId,
+    });
+    const rootBoundary = rootTranscript.at(-1)!;
+
+    const child = await repository.prepareFork({
+      actor: fixture.actor,
+      command: {
+        kind: 'fork-message',
+        commandId: '81818181-8181-4181-8181-818181818181',
+        workflowId: fixture.workflowId,
+        sourceRevisionId: fixture.trunkRevisionId,
+        title: 'Ordinal child',
+        parentSessionId: root.sessionId,
+        atMessageId: rootBoundary.id,
+        agentBindingId: fixture.agentBindingId,
+        anchor: {
+          sourceKind: 'message',
+          sourceId: rootBoundary.id,
+          selector: { kind: 'text-quote', exact: 'Root completion for fork' },
+        },
+      },
+    });
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: child.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: child.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: 'fake-session:fork-ordinal-child',
+    });
+    await repository.attachRuntimeSession({
+      actor: fixture.actor,
+      commandReceiptId: child.commandReceiptId,
+      runtimeSession: {
+        externalSessionRef: 'fake-session:fork-ordinal-child',
+        runtimeVersion: 'deterministic-v1',
+        replayStatus: 'complete',
+        historyDigest: 'sha256:fork-ordinal-child',
+        metadata: {},
+      },
+    });
+
+    const childRun = await repository.prepareRun({
+      actor: fixture.actor,
+      commandId: '82828282-8282-4282-8282-828282828282',
+      idempotencyKey: 'fork-ordinal-child-run',
+      sessionId: child.sessionId,
+      content: 'Child prompt after inherited prefix',
+    });
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: childRun.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: childRun.commandReceiptId,
+      externalResourceKind: 'run',
+      externalResourceRef: 'fake-run:fork-ordinal-child',
+    });
+    await repository.attachRuntimeRun({
+      actor: fixture.actor,
+      commandReceiptId: childRun.commandReceiptId,
+      runtimeRun: {
+        externalRunRef: 'fake-run:fork-ordinal-child',
+        acceptedAt: '2026-07-18T05:00:01.000Z',
+      },
+    });
+    await repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: childRun.runId,
+      event: {
+        runtimeEventKey: 'fork-ordinal-child-completed',
+        eventType: 'run.completed',
+        payload: { status: 'succeeded' },
+        occurredAt: '2026-07-18T05:00:02.000Z',
+        message: {
+          role: 'assistant',
+          content: { text: 'Child completion for grandchild' },
+        },
+        terminal: { status: 'succeeded' },
+      },
+    });
+    const childTranscript = await repository.loadSessionTranscript({
+      actor: fixture.actor,
+      sessionId: child.sessionId,
+    });
+    const childBoundary = childTranscript.at(-1)!;
+
+    const grandchild = await repository.prepareFork({
+      actor: fixture.actor,
+      command: {
+        kind: 'fork-message',
+        commandId: '83838383-8383-4383-8383-838383838383',
+        workflowId: fixture.workflowId,
+        sourceRevisionId: fixture.trunkRevisionId,
+        title: 'Ordinal grandchild',
+        parentSessionId: child.sessionId,
+        atMessageId: childBoundary.id,
+        agentBindingId: fixture.agentBindingId,
+        anchor: {
+          sourceKind: 'message',
+          sourceId: childBoundary.id,
+          selector: { kind: 'text-quote', exact: 'Child completion for grandchild' },
+        },
+      },
+    });
+    expect(childTranscript.map((message) => message.ordinal)).toEqual([0, 1, 2, 3]);
+    expect(grandchild.transcriptPrefix.map((message) => message.canvasMessageId)).toEqual(
+      childTranscript.map((message) => message.id),
+    );
+    const [childState] = await sql<{ transcript_version: number }[]>`
+      SELECT transcript_version FROM sessions WHERE id = ${child.sessionId}
+    `;
+    expect(childState?.transcript_version).toBe(4);
+  });
+
   it('freezes a fork prefix and preserves the complete ancestor prefix for a fork-of-fork', async () => {
     const fixture = await bootstrapFixture();
     const root = await repository.createRootSession({
@@ -2176,6 +2315,79 @@ describe('PostgresControlPlaneRepository', () => {
     });
   });
 
+  it('returns an absent reconciled Run to a fresh dispatch lease', async () => {
+    const { fixture, prepared } = await prepareRuntimeRun({
+      suffix: 'run-absent-retry',
+      attachRun: false,
+    });
+    await repository.markRuntimeCommandReconciling({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      externalResourceKind: 'run',
+      lookupMetadata: { transport: 'timeout' },
+      error: 'Run dispatch outcome unknown',
+    });
+    await expect(repository.resolveRuntimeReconciliation({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      resolution: {
+        kind: 'absent',
+        evidence: { listRuns: 'no-match' },
+      },
+    })).resolves.toEqual({ phase: 'retryable_failure', outcome: 'absent' });
+
+    const [retryableState] = await sql<{
+      phase: string;
+      receipt_error: string | null;
+      run_status: string;
+      run_error: string | null;
+      run_completed: Date | null;
+      compensation_status: string;
+    }[]>`
+      SELECT receipt.orchestration_phase::text AS phase,
+        receipt.last_error AS receipt_error, run.status::text AS run_status,
+        run.error_message AS run_error, run.completed_at AS run_completed,
+        compensation.status::text AS compensation_status
+      FROM command_receipts receipt
+      JOIN runs run ON run.id = receipt.result_id
+      JOIN runtime_compensations compensation
+        ON compensation.command_receipt_id = receipt.id
+      WHERE receipt.id = ${prepared.commandReceiptId}
+    `;
+    await expect(repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+    })).resolves.toEqual({ phase: 'runtime_dispatched', dispatchAllowed: true });
+    expect(retryableState).toMatchObject({
+      phase: 'retryable_failure',
+      receipt_error: null,
+      run_status: 'failed',
+      run_error: null,
+      compensation_status: 'succeeded',
+    });
+    expect(retryableState?.run_completed).toBeInstanceOf(Date);
+
+    const [leasedState] = await sql<{
+      phase: string;
+      run_status: string;
+      run_error: string | null;
+      run_completed: Date | null;
+    }[]>`
+      SELECT receipt.orchestration_phase::text AS phase,
+        run.status::text AS run_status, run.error_message AS run_error,
+        run.completed_at AS run_completed
+      FROM command_receipts receipt
+      JOIN runs run ON run.id = receipt.result_id
+      WHERE receipt.id = ${prepared.commandReceiptId}
+    `;
+    expect(leasedState).toEqual({
+      phase: 'runtime_dispatched',
+      run_status: 'queued',
+      run_error: null,
+      run_completed: null,
+    });
+  });
+
   it('prepares one idempotent Run under concurrency and rejects payload or idempotency conflicts', async () => {
     const fixture = await bootstrapFixture();
     const session = await repository.createRootSession({
@@ -2396,6 +2608,9 @@ describe('PostgresControlPlaneRepository', () => {
         ${dormantMessageId}, ${fixture.workflowId}, ${session.sessionId}, 0,
         'user', ${fixture.accountId}, ${sql.json('Dormant race Run')}, 'completed'
       )
+    `;
+    await sql`
+      UPDATE sessions SET transcript_version = 1 WHERE id = ${session.sessionId}
     `;
     await sql`
       INSERT INTO runs (
@@ -3509,7 +3724,7 @@ describe('PostgresControlPlaneRepository', () => {
     })).rejects.toThrow('Unauthorized control-plane operation');
   });
 
-  it('keeps command failure, retry lease, and reconciliation status synchronized with its Run', async () => {
+  it('terminalizes proven dispatch failures but keeps unknown Runtime effects active', async () => {
     const { fixture, prepared } = await prepareRuntimeRun({
       suffix: 'command-run-state',
       attachRun: false,
@@ -3601,8 +3816,9 @@ describe('PostgresControlPlaneRepository', () => {
     expect(state).toMatchObject({
       phase: 'reconciling',
       receipt_error: 'reconciliation-failed',
-      run_status: 'failed',
+      run_status: 'reconciling',
       run_error: 'reconciliation-failed',
+      run_completed: null,
     });
     await expect(repository.prepareRun({
       actor: fixture.actor,
@@ -3610,7 +3826,57 @@ describe('PostgresControlPlaneRepository', () => {
       idempotencyKey: 'replacement-after-command-failure',
       sessionId: prepared.sessionId,
       content: 'Replacement after failed dispatch',
-    })).resolves.toMatchObject({ status: 'queued' });
+    })).rejects.toMatchObject({ code: 'active_run_conflict' });
+  });
+
+  it('treats a Runtime command failure after Run attachment as a strict no-op', async () => {
+    const { fixture, prepared, externalRunRef } = await prepareRuntimeRun({
+      suffix: 'late-attached-failure',
+    });
+    await repository.markRuntimeCommandFailure({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      retryable: false,
+      error: 'late failure after attach',
+    });
+
+    const [state] = await sql<{
+      phase: string;
+      receipt_error: string | null;
+      run_status: string;
+      run_error: string | null;
+      run_completed: Date | null;
+      runtime_run_ref: string | null;
+    }[]>`
+      SELECT receipt.orchestration_phase::text AS phase,
+        receipt.last_error AS receipt_error, run.status::text AS run_status,
+        run.error_message AS run_error, run.completed_at AS run_completed,
+        run.runtime_run_ref
+      FROM command_receipts receipt
+      JOIN runs run ON run.id = receipt.result_id
+      WHERE receipt.id = ${prepared.commandReceiptId}
+    `;
+    expect(state).toEqual({
+      phase: 'attached',
+      receipt_error: null,
+      run_status: 'running',
+      run_error: null,
+      run_completed: null,
+      runtime_run_ref: externalRunRef,
+    });
+    await expect(repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'late-attached-failure-completed',
+        eventType: 'run.completed',
+        payload: { status: 'succeeded' },
+        occurredAt: '2026-07-18T06:00:00.000Z',
+        terminal: { status: 'succeeded' },
+      },
+    })).resolves.toMatchObject({
+      runtimeEventKey: 'late-attached-failure-completed',
+    });
   });
 
   it('loads a consistent Session snapshot and persists Runtime history and unavailable state', async () => {

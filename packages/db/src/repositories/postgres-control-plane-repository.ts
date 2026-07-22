@@ -2137,9 +2137,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       }));
 
       const [nextMessage] = await tx<{ ordinal: number }[]>`
-        SELECT (COALESCE(MAX(ordinal), -1) + 1)::integer AS ordinal
-        FROM messages
-        WHERE session_id = ${input.sessionId}
+        UPDATE sessions
+        SET transcript_version = transcript_version + 1, updated_at = now()
+        WHERE id = ${input.sessionId}
+        RETURNING (transcript_version - 1)::integer AS ordinal
       `;
       if (!nextMessage) throw new Error('Next Session Message ordinal is unavailable');
 
@@ -2921,9 +2922,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         `;
         if (!lockedSession) throw new AuthorizationError();
         const [nextMessage] = await tx<{ ordinal: number }[]>`
-          SELECT (COALESCE(MAX(ordinal), -1) + 1)::integer AS ordinal
-          FROM messages
-          WHERE session_id = ${run.session_id}
+          UPDATE sessions
+          SET transcript_version = transcript_version + 1, updated_at = now()
+          WHERE id = ${run.session_id}
+          RETURNING (transcript_version - 1)::integer AS ordinal
         `;
         if (!nextMessage) throw new Error('Next Session Message ordinal is unavailable');
         await tx`
@@ -3175,15 +3177,6 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         input.actor,
         input.commandReceiptId,
       );
-      if (receipt.run_id !== null) {
-        await tx`
-          UPDATE runs
-          SET status = 'failed', error_code = NULL,
-            error_message = ${input.error}, completed_at = now()
-          WHERE id = ${receipt.run_id}
-            AND status IN ('queued', 'running', 'waiting_approval', 'reconciling')
-        `;
-      }
       if (
         receipt.orchestration_phase === 'attached'
         || receipt.orchestration_phase === 'terminal_failure'
@@ -3194,6 +3187,19 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         receipt.orchestration_phase === 'runtime_known'
         || receipt.orchestration_phase === 'reconciling'
       ) {
+        if (receipt.run_id !== null) {
+          const [run] = await tx<{ id: string }[]>`
+            UPDATE runs
+            SET status = 'reconciling', error_code = NULL,
+              error_message = ${input.error}, completed_at = NULL
+            WHERE id = ${receipt.run_id}
+              AND status IN ('queued', 'running', 'waiting_approval', 'reconciling')
+            RETURNING id
+          `;
+          if (!run) {
+            throw new Error('Runtime failure reconciliation cannot update its active Run');
+          }
+        }
         const externalResourceKind = receipt.result_type;
         const lookupMetadata = Object.keys(receipt.external_lookup_metadata).length > 0
           ? receipt.external_lookup_metadata
@@ -3219,6 +3225,15 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           receipt.orchestration_phase !== 'reconciling',
         );
         return;
+      }
+      if (receipt.run_id !== null) {
+        await tx`
+          UPDATE runs
+          SET status = 'failed', error_code = NULL,
+            error_message = ${input.error}, completed_at = now()
+          WHERE id = ${receipt.run_id}
+            AND status IN ('queued', 'running', 'waiting_approval', 'reconciling')
+        `;
       }
       const phase = input.retryable ? 'retryable_failure' : 'terminal_failure';
       await tx`
@@ -3368,6 +3383,18 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
             resolved_at = now(), updated_at = now()
           WHERE id = ${compensation.id}
         `;
+        if (receipt.run_id !== null) {
+          const [run] = await tx<{ id: string }[]>`
+            UPDATE runs
+            SET status = 'failed', error_code = NULL, error_message = NULL,
+              completed_at = now()
+            WHERE id = ${receipt.run_id} AND status = 'reconciling'
+            RETURNING id
+          `;
+          if (!run) {
+            throw new Error('Absent Runtime reconciliation cannot reset its Run');
+          }
+        }
         await tx`
           UPDATE command_receipts
           SET orchestration_phase = 'retryable_failure', last_error = NULL,
