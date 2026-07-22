@@ -4,7 +4,15 @@ import type {
   ForkMessageSessionCommand,
 } from '@ai-super-canvas/core';
 
-import type { PrepareRunInput, PreparedRun } from './control-plane-run-types';
+import type {
+  PersistableRunEvent,
+  PrepareRunInput,
+  PreparedRun,
+  RunRuntimeContext,
+  RuntimeRunAttachment,
+  StoredSessionSnapshot,
+  StoredRunEvent,
+} from './control-plane-run-types';
 
 export interface LocalAlphaModelSeed {
   providerKey: string;
@@ -307,6 +315,46 @@ export interface ControlPlaneRepository {
   beginRuntimeDispatch(input: BeginRuntimeDispatchInput): Promise<RuntimeDispatchState>;
   recordRuntimeResourceKnown(input: RuntimeResourceKnownInput): Promise<void>;
   attachRuntimeSession(input: AttachRuntimeSessionInput): Promise<void>;
+  attachRuntimeRun(input: {
+    actor: ActorContext;
+    commandReceiptId: string;
+    runtimeRun: RuntimeRunAttachment;
+  }): Promise<void>;
+  ingestRuntimeEvent(input: {
+    actor: ActorContext;
+    runId: string;
+    event: PersistableRunEvent;
+  }): Promise<StoredRunEvent>;
+  listRunEvents(input: {
+    actor: ActorContext;
+    runId: string;
+    after: number;
+    limit?: number;
+  }): Promise<StoredRunEvent[]>;
+  getRunRuntimeContext(input: {
+    actor: ActorContext;
+    runId: string;
+  }): Promise<RunRuntimeContext>;
+  loadSessionSnapshot(input: {
+    actor: ActorContext;
+    sessionId: string;
+  }): Promise<StoredSessionSnapshot>;
+  syncRuntimeSessionHistory(input: {
+    actor: ActorContext;
+    sessionId: string;
+    historyDigest: string;
+  }): Promise<void>;
+  markRuntimeSessionUnavailable(input: {
+    actor: ActorContext;
+    sessionId: string;
+    error: string;
+  }): Promise<void>;
+  markRunReconciling(input: {
+    actor: ActorContext;
+    runId: string;
+    error: string;
+  }): Promise<void>;
+  reconcileOrphanedRuns(): Promise<number>;
   markRuntimeCommandFailure(input: RuntimeCommandFailureInput): Promise<void>;
   markRuntimeCommandReconciling(input: RuntimeCommandReconcileInput): Promise<void>;
   resolveRuntimeReconciliation(

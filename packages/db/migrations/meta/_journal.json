@@ -43,6 +43,13 @@
       "when": 1784374958761,
       "tag": "0005_prepared_run_invariants",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1784711848089,
+      "tag": "0006_runtime_event_fingerprint",
+      "breakpoints": true
     }
   ]
 }

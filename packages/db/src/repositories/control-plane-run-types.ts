@@ -20,6 +20,33 @@ export class RunIdempotencyConflictError extends Error {
   }
 }
 
+export class RuntimeEventConflictError extends Error {
+  readonly code = 'runtime_event_conflict' as const;
+
+  constructor(runtimeEventKey: string) {
+    super(`Runtime event conflict for ${runtimeEventKey}`);
+    this.name = 'RuntimeEventConflictError';
+  }
+}
+
+export class RunRuntimeContextUnavailableError extends Error {
+  readonly code = 'run_runtime_context_unavailable' as const;
+
+  constructor() {
+    super('Run Runtime context is incomplete');
+    this.name = 'RunRuntimeContextUnavailableError';
+  }
+}
+
+export class RunStateConflictError extends Error {
+  readonly code = 'run_state_conflict' as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'RunStateConflictError';
+  }
+}
+
 export type StoredRunStatus =
   | 'queued'
   | 'running'

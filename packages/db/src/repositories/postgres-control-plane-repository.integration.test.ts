@@ -49,6 +49,72 @@ describe('PostgresControlPlaneRepository', () => {
     };
   }
 
+  async function prepareRuntimeRun(input: {
+    suffix: string;
+    content?: string;
+    attachRun?: boolean;
+  }) {
+    const fixture = await bootstrapFixture();
+    const session = await repository.createRootSession({
+      actor: fixture.actor,
+      commandId: '70707070-1010-4010-8010-101010101010',
+      workflowId: fixture.workflowId,
+      agentBindingId: fixture.agentBindingId,
+      title: `Runtime Run ${input.suffix}`,
+    });
+    const externalSessionRef = `fake-session-${input.suffix}`;
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: externalSessionRef,
+    });
+    await repository.attachRuntimeSession({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      runtimeSession: {
+        externalSessionRef,
+        runtimeVersion: 'deterministic-v1',
+        replayStatus: 'complete',
+        historyDigest: `history-${input.suffix}`,
+        metadata: { fixture: input.suffix },
+      },
+    });
+    const prepared = await repository.prepareRun({
+      actor: fixture.actor,
+      commandId: '71717171-1010-4010-8010-101010101010',
+      idempotencyKey: `run-${input.suffix}`,
+      sessionId: session.sessionId,
+      content: input.content ?? `Prompt ${input.suffix}`,
+    });
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+    });
+    const externalRunRef = `fake-run-${input.suffix}`;
+    if (input.attachRun !== false) {
+      await repository.recordRuntimeResourceKnown({
+        actor: fixture.actor,
+        commandReceiptId: prepared.commandReceiptId,
+        externalResourceKind: 'run',
+        externalResourceRef: externalRunRef,
+      });
+      await repository.attachRuntimeRun({
+        actor: fixture.actor,
+        commandReceiptId: prepared.commandReceiptId,
+        runtimeRun: {
+          externalRunRef,
+          acceptedAt: '2026-07-18T04:00:00.000Z',
+        },
+      });
+    }
+    return { fixture, session, prepared, externalSessionRef, externalRunRef };
+  }
+
   it('bootstraps concurrent identical commands once and compares exact UTF-8 canonical payloads', async () => {
     const input = {
       commandId: '40404040-4040-4040-8040-404040404040',
@@ -2929,5 +2995,769 @@ describe('PostgresControlPlaneRepository', () => {
     `;
     await sql`DELETE FROM context_refs`;
     await expect(repository.prepareRun({ ...input })).resolves.toEqual(prepared);
+  });
+
+  it('attaches a Runtime Run and atomically projects message and terminal events', async () => {
+    const fixture = await bootstrapFixture();
+    const session = await repository.createRootSession({
+      actor: fixture.actor,
+      commandId: '60606060-1010-4010-8010-101010101010',
+      workflowId: fixture.workflowId,
+      agentBindingId: fixture.agentBindingId,
+      title: 'Runtime event projection Session',
+    });
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: 'fake-session-runtime-events',
+    });
+    await repository.attachRuntimeSession({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      runtimeSession: {
+        externalSessionRef: 'fake-session-runtime-events',
+        runtimeVersion: 'deterministic-v1',
+        replayStatus: 'complete',
+        historyDigest: 'runtime-events-history',
+        metadata: {},
+      },
+    });
+    const prepared = await repository.prepareRun({
+      actor: fixture.actor,
+      commandId: '61616161-1010-4010-8010-101010101010',
+      idempotencyKey: 'runtime-event-projection',
+      sessionId: session.sessionId,
+      content: 'Project this Runtime response',
+    });
+    await expect(repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+    })).resolves.toEqual({ phase: 'runtime_dispatched', dispatchAllowed: true });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      externalResourceKind: 'run',
+      externalResourceRef: 'fake-run-runtime-events',
+    });
+    await repository.attachRuntimeRun({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      runtimeRun: {
+        externalRunRef: 'fake-run-runtime-events',
+        acceptedAt: '2026-07-18T03:00:00.000Z',
+      },
+    });
+
+    const message = await repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'event-message-1',
+        eventType: 'assistant.message',
+        payload: { delta: 'Runtime response' },
+        externalEventRef: 'runtime-event-ref-1',
+        occurredAt: '2026-07-18T03:00:01.000Z',
+        message: {
+          role: 'assistant',
+          content: { text: 'Runtime response' },
+          externalMessageRef: 'runtime-message-ref-1',
+        },
+      },
+    });
+    const terminal = await repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'event-terminal-1',
+        eventType: 'run.completed',
+        payload: { status: 'succeeded' },
+        occurredAt: '2026-07-18T03:00:02.000Z',
+        terminal: { status: 'succeeded' },
+      },
+    });
+
+    expect(message).toMatchObject({
+      runId: prepared.runId,
+      sequence: 1,
+      runtimeEventKey: 'event-message-1',
+      occurredAt: '2026-07-18T03:00:01.000Z',
+    });
+    expect(terminal).toMatchObject({
+      runId: prepared.runId,
+      sequence: 2,
+      runtimeEventKey: 'event-terminal-1',
+      occurredAt: '2026-07-18T03:00:02.000Z',
+    });
+    await expect(repository.loadSessionTranscript({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject([
+      { role: 'user', content: 'Project this Runtime response' },
+      {
+        role: 'assistant',
+        content: { text: 'Runtime response' },
+        runId: prepared.runId,
+        sourceRuntimeEventKey: 'event-message-1',
+      },
+    ]);
+    const [state] = await sql<{
+      run_status: string;
+      runtime_run_ref: string | null;
+      receipt_phase: string;
+      receipt_payload: unknown;
+    }[]>`
+      SELECT run.status::text AS run_status, run.runtime_run_ref,
+        receipt.orchestration_phase::text AS receipt_phase,
+        receipt.result_payload AS receipt_payload
+      FROM runs run
+      JOIN command_receipts receipt ON receipt.result_id = run.id
+      WHERE run.id = ${prepared.runId}
+    `;
+    expect(state).toMatchObject({
+      run_status: 'succeeded',
+      runtime_run_ref: 'fake-run-runtime-events',
+      receipt_phase: 'attached',
+      receipt_payload: prepared,
+    });
+  });
+
+  it('bounds Runtime event pagination to an explicit maximum page size', async () => {
+    const { fixture, prepared } = await prepareRuntimeRun({ suffix: 'event-pagination' });
+    for (const index of [1, 2, 3]) {
+      await repository.ingestRuntimeEvent({
+        actor: fixture.actor,
+        runId: prepared.runId,
+        event: {
+          runtimeEventKey: `page-key-${index}`,
+          eventType: 'assistant.delta',
+          payload: { index },
+          occurredAt: `2026-07-18T03:30:0${index}.000Z`,
+        },
+      });
+    }
+
+    await expect(repository.listRunEvents({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      after: 0,
+      limit: 2,
+    })).resolves.toHaveLength(2);
+    await expect(repository.listRunEvents({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      after: 0,
+      limit: 0,
+    })).rejects.toThrow('Run event limit must be an integer between 1 and 100');
+    await expect(repository.listRunEvents({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      after: 0,
+      limit: 101,
+    })).rejects.toThrow('Run event limit must be an integer between 1 and 100');
+  });
+
+  it('deduplicates Runtime event keys, preserves distinct deltas, paginates, and freezes terminal Runs', async () => {
+    const { fixture, prepared } = await prepareRuntimeRun({ suffix: 'event-idempotency' });
+    const firstInput = {
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'message-key',
+        eventType: 'assistant.message',
+        payload: { value: 'same-content' },
+        occurredAt: '2026-07-18T04:00:01.000Z',
+        message: { role: 'assistant' as const, content: { text: 'one message' } },
+      },
+    };
+    const first = await repository.ingestRuntimeEvent(firstInput);
+    await expect(repository.ingestRuntimeEvent({
+      ...firstInput,
+      event: {
+        ...firstInput.event,
+        payload: { value: 'conflicting-replay-payload' },
+      },
+    })).rejects.toMatchObject({ code: 'runtime_event_conflict' });
+    await expect(repository.ingestRuntimeEvent({
+      ...firstInput,
+      event: {
+        ...firstInput.event,
+        message: { role: 'assistant', content: { text: 'conflicting message' } },
+      },
+    })).rejects.toMatchObject({ code: 'runtime_event_conflict' });
+    await expect(repository.ingestRuntimeEvent({
+      ...firstInput,
+      event: {
+        ...firstInput.event,
+        terminal: {
+          status: 'failed',
+          errorCode: 'runtime_conflict',
+          errorMessage: 'conflicting terminal envelope',
+        },
+      },
+    })).rejects.toMatchObject({ code: 'runtime_event_conflict' });
+    const [unchangedReplayRows] = await sql<{ events: number; messages: number }[]>`
+      SELECT
+        (SELECT count(*)::integer FROM run_events
+          WHERE run_id = ${prepared.runId}) AS events,
+        (SELECT count(*)::integer FROM messages
+          WHERE run_id = ${prepared.runId}) AS messages
+    `;
+    expect(unchangedReplayRows).toEqual({ events: 1, messages: 1 });
+
+    const second = await repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'delta-key-1',
+        eventType: 'assistant.delta',
+        payload: { value: 'same-content' },
+        occurredAt: '2026-07-18T04:00:02.000Z',
+      },
+    });
+    const third = await repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'delta-key-2',
+        eventType: 'assistant.delta',
+        payload: { value: 'same-content' },
+        occurredAt: '2026-07-18T04:00:03.000Z',
+      },
+    });
+    const terminalInput = {
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'terminal-key',
+        eventType: 'run.completed',
+        payload: { status: 'succeeded' },
+        occurredAt: '2026-07-18T04:00:04.000Z',
+        terminal: { status: 'succeeded' as const },
+      },
+    };
+    const terminal = await repository.ingestRuntimeEvent(terminalInput);
+
+    expect([first.sequence, second.sequence, third.sequence, terminal.sequence]).toEqual([
+      1, 2, 3, 4,
+    ]);
+    await expect(repository.ingestRuntimeEvent(terminalInput)).resolves.toEqual(terminal);
+    await expect(repository.ingestRuntimeEvent(firstInput)).resolves.toEqual(first);
+    await expect(repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'late-key',
+        eventType: 'assistant.delta',
+        payload: { late: true },
+        occurredAt: '2026-07-18T04:00:05.000Z',
+      },
+    })).rejects.toThrow('Run is terminal and cannot accept a new Runtime event');
+    await expect(repository.listRunEvents({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      after: 1,
+    })).resolves.toMatchObject([
+      { sequence: 2, runtimeEventKey: 'delta-key-1' },
+      { sequence: 3, runtimeEventKey: 'delta-key-2' },
+      { sequence: 4, runtimeEventKey: 'terminal-key' },
+    ]);
+    await expect(repository.listRunEvents({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      after: -1,
+    })).rejects.toThrow(/non-negative safe integer/i);
+    const [counts] = await sql<{ events: number; messages: number }[]>`
+      SELECT
+        (SELECT count(*)::integer FROM run_events
+          WHERE run_id = ${prepared.runId}) AS events,
+        (SELECT count(*)::integer FROM messages
+          WHERE run_id = ${prepared.runId}) AS messages
+    `;
+    expect(counts).toEqual({ events: 4, messages: 1 });
+  });
+
+  it('rolls back both event and Message when Runtime message JSON serialization fails', async () => {
+    const { fixture, prepared } = await prepareRuntimeRun({ suffix: 'event-rollback' });
+    const eventBase = {
+      runtimeEventKey: 'rollback-key',
+      eventType: 'assistant.message',
+      payload: { stage: 'inserted-before-message' },
+      occurredAt: '2026-07-18T04:10:01.000Z',
+    };
+    await expect(repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        ...eventBase,
+        message: { role: 'assistant', content: 1n as never },
+      },
+    })).rejects.toThrow();
+    const [rolledBack] = await sql<{ events: number; messages: number }[]>`
+      SELECT
+        (SELECT count(*)::integer FROM run_events
+          WHERE run_id = ${prepared.runId}) AS events,
+        (SELECT count(*)::integer FROM messages
+          WHERE run_id = ${prepared.runId}) AS messages
+    `;
+    expect(rolledBack).toEqual({ events: 0, messages: 0 });
+
+    await expect(repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        ...eventBase,
+        message: { role: 'assistant', content: { text: 'valid retry' } },
+      },
+    })).resolves.toMatchObject({ sequence: 1, runtimeEventKey: 'rollback-key' });
+  });
+
+  it('serializes concurrent Runtime events to unique contiguous Run sequences', async () => {
+    const { fixture, prepared } = await prepareRuntimeRun({ suffix: 'event-concurrency' });
+    const stored = await Promise.all(Array.from({ length: 8 }, (_, index) => (
+      repository.ingestRuntimeEvent({
+        actor: fixture.actor,
+        runId: prepared.runId,
+        event: {
+          runtimeEventKey: `concurrent-${index}`,
+          eventType: 'assistant.delta',
+          payload: { index },
+          occurredAt: `2026-07-18T04:20:0${index}.000Z`,
+        },
+      })
+    )));
+    expect(stored.map((event) => event.sequence).sort((left, right) => left - right)).toEqual(
+      [1, 2, 3, 4, 5, 6, 7, 8],
+    );
+    await expect(repository.listRunEvents({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      after: 0,
+    })).resolves.toSatisfy((events: Array<{ sequence: number }>) => (
+      events.map((event) => event.sequence).join(',') === '1,2,3,4,5,6,7,8'
+    ));
+  });
+
+  it('requires complete Runtime refs, keeps Run attach idempotent, and authorizes viewer reads', async () => {
+    const { fixture, prepared, externalRunRef, externalSessionRef } = await prepareRuntimeRun({
+      suffix: 'runtime-context',
+      attachRun: false,
+    });
+    await expect(repository.getRunRuntimeContext({
+      actor: fixture.actor,
+      runId: prepared.runId,
+    })).rejects.toThrow('Run Runtime context is incomplete');
+
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      externalResourceKind: 'run',
+      externalResourceRef: externalRunRef,
+    });
+    const attachment = {
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      runtimeRun: {
+        externalRunRef,
+        acceptedAt: '2026-07-18T04:30:00.000Z',
+      },
+    };
+    await repository.attachRuntimeRun(attachment);
+    await expect(repository.attachRuntimeRun({ ...attachment })).resolves.toBeUndefined();
+    await expect(repository.attachRuntimeRun({
+      ...attachment,
+      runtimeRun: { ...attachment.runtimeRun, externalRunRef: 'conflicting-run-ref' },
+    })).rejects.toThrow(/conflicts/i);
+
+    const viewerAccountId = '72727272-1010-4010-8010-101010101010';
+    const viewer = { accountId: viewerAccountId, authSubject: 'local:runtime-context-viewer' };
+    await sql`
+      INSERT INTO accounts (id, auth_subject, display_name)
+      VALUES (${viewerAccountId}, ${viewer.authSubject}, 'Runtime context viewer')
+    `;
+    await sql`
+      INSERT INTO workspace_members (workspace_id, account_id, role)
+      VALUES (${fixture.workspaceId}, ${viewerAccountId}, 'viewer')
+    `;
+    await sql`
+      INSERT INTO agent_access_grants (
+        id, agent_id, account_id, role, granted_by_account_id
+      ) VALUES (
+        '73737373-1010-4010-8010-101010101010', ${fixture.agentId},
+        ${viewerAccountId}, 'use', ${fixture.accountId}
+      )
+    `;
+    await expect(repository.getRunRuntimeContext({
+      actor: viewer,
+      runId: prepared.runId,
+    })).resolves.toEqual({
+      actor: viewer,
+      workflowId: fixture.workflowId,
+      sessionId: prepared.sessionId,
+      runId: prepared.runId,
+      status: 'running',
+      binding: prepared.runtime.binding,
+      externalSessionRef,
+      externalRunRef,
+    });
+    await expect(repository.getRunRuntimeContext({
+      actor: { accountId: fixture.accountId, authSubject: 'local:wrong-subject' },
+      runId: prepared.runId,
+    })).rejects.toThrow('Unauthorized control-plane operation');
+  });
+
+  it('keeps command failure, retry lease, and reconciliation status synchronized with its Run', async () => {
+    const { fixture, prepared } = await prepareRuntimeRun({
+      suffix: 'command-run-state',
+      attachRun: false,
+    });
+    await repository.markRuntimeCommandFailure({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      retryable: true,
+      error: 'dispatch-timeout',
+    });
+    let [state] = await sql<{
+      phase: string;
+      receipt_error: string | null;
+      run_status: string;
+      run_error: string | null;
+      run_completed: Date | null;
+    }[]>`
+      SELECT receipt.orchestration_phase::text AS phase,
+        receipt.last_error AS receipt_error, run.status::text AS run_status,
+        run.error_message AS run_error, run.completed_at AS run_completed
+      FROM command_receipts receipt
+      JOIN runs run ON run.id = receipt.result_id
+      WHERE receipt.id = ${prepared.commandReceiptId}
+    `;
+    expect(state).toMatchObject({
+      phase: 'retryable_failure',
+      receipt_error: 'dispatch-timeout',
+      run_status: 'failed',
+      run_error: 'dispatch-timeout',
+    });
+    expect(state?.run_completed).toBeInstanceOf(Date);
+
+    await expect(repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+    })).resolves.toEqual({ phase: 'runtime_dispatched', dispatchAllowed: true });
+    [state] = await sql`
+      SELECT receipt.orchestration_phase::text AS phase,
+        receipt.last_error AS receipt_error, run.status::text AS run_status,
+        run.error_message AS run_error, run.completed_at AS run_completed
+      FROM command_receipts receipt
+      JOIN runs run ON run.id = receipt.result_id
+      WHERE receipt.id = ${prepared.commandReceiptId}
+    `;
+    expect(state).toMatchObject({
+      phase: 'runtime_dispatched',
+      receipt_error: null,
+      run_status: 'queued',
+      run_error: null,
+      run_completed: null,
+    });
+
+    await repository.markRuntimeCommandReconciling({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      externalResourceKind: 'run',
+      error: 'dispatch-response-lost',
+    });
+    [state] = await sql`
+      SELECT receipt.orchestration_phase::text AS phase,
+        receipt.last_error AS receipt_error, run.status::text AS run_status,
+        run.error_message AS run_error, run.completed_at AS run_completed
+      FROM command_receipts receipt
+      JOIN runs run ON run.id = receipt.result_id
+      WHERE receipt.id = ${prepared.commandReceiptId}
+    `;
+    expect(state).toMatchObject({
+      phase: 'reconciling',
+      receipt_error: 'dispatch-response-lost',
+      run_status: 'reconciling',
+      run_error: 'dispatch-response-lost',
+      run_completed: null,
+    });
+
+    await repository.markRuntimeCommandFailure({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      retryable: true,
+      error: 'reconciliation-failed',
+    });
+    [state] = await sql`
+      SELECT receipt.orchestration_phase::text AS phase,
+        receipt.last_error AS receipt_error, run.status::text AS run_status,
+        run.error_message AS run_error, run.completed_at AS run_completed
+      FROM command_receipts receipt
+      JOIN runs run ON run.id = receipt.result_id
+      WHERE receipt.id = ${prepared.commandReceiptId}
+    `;
+    expect(state).toMatchObject({
+      phase: 'reconciling',
+      receipt_error: 'reconciliation-failed',
+      run_status: 'failed',
+      run_error: 'reconciliation-failed',
+    });
+    await expect(repository.prepareRun({
+      actor: fixture.actor,
+      commandId: '77777777-1010-4010-8010-101010101010',
+      idempotencyKey: 'replacement-after-command-failure',
+      sessionId: prepared.sessionId,
+      content: 'Replacement after failed dispatch',
+    })).resolves.toMatchObject({ status: 'queued' });
+  });
+
+  it('loads a consistent Session snapshot and persists Runtime history and unavailable state', async () => {
+    const { fixture, session, prepared, externalSessionRef } = await prepareRuntimeRun({
+      suffix: 'session-snapshot',
+    });
+    await repository.syncRuntimeSessionHistory({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+      historyDigest: 'history-snapshot-updated',
+    });
+    await expect(repository.loadSessionSnapshot({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject({
+      sessionId: session.sessionId,
+      status: 'active',
+      messages: [{ role: 'user', content: 'Prompt session-snapshot' }],
+      activeRun: { runId: prepared.runId, status: 'running' },
+      runtimeRef: { externalSessionRef, status: 'active' },
+    });
+    const [synced] = await sql<{ history_digest: string }[]>`
+      SELECT metadata->>'historyDigest' AS history_digest
+      FROM session_runtime_refs
+      WHERE session_id = ${session.sessionId} AND is_primary = true
+    `;
+    expect(synced?.history_digest).toBe('history-snapshot-updated');
+
+    await repository.markRunReconciling({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      error: 'event-pump-gap',
+    });
+    await repository.markRuntimeSessionUnavailable({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+      error: 'runtime-offline',
+    });
+    await expect(repository.loadSessionSnapshot({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject({
+      activeRun: { runId: prepared.runId, status: 'reconciling' },
+      runtimeRef: { externalSessionRef, status: 'error' },
+    });
+    const [state] = await sql<{
+      run_error: string | null;
+      runtime_error: string | null;
+    }[]>`
+      SELECT run.error_message AS run_error,
+        runtime_ref.metadata->>'lastError' AS runtime_error
+      FROM runs run
+      JOIN session_runtime_refs runtime_ref ON runtime_ref.session_id = run.session_id
+      WHERE run.id = ${prepared.runId} AND runtime_ref.is_primary = true
+    `;
+    expect(state).toEqual({ run_error: 'event-pump-gap', runtime_error: 'runtime-offline' });
+    await expect(repository.syncRuntimeSessionHistory({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+      historyDigest: 'must-not-sync-error-ref',
+    })).rejects.toThrow(/active primary Runtime reference/i);
+
+    const viewerAccountId = '74747474-1010-4010-8010-101010101010';
+    const viewer = { accountId: viewerAccountId, authSubject: 'local:snapshot-viewer' };
+    await sql`
+      INSERT INTO accounts (id, auth_subject, display_name)
+      VALUES (${viewerAccountId}, ${viewer.authSubject}, 'Snapshot viewer')
+    `;
+    await sql`
+      INSERT INTO workspace_members (workspace_id, account_id, role)
+      VALUES (${fixture.workspaceId}, ${viewerAccountId}, 'viewer')
+    `;
+    await sql`
+      INSERT INTO agent_access_grants (
+        id, agent_id, account_id, role, granted_by_account_id
+      ) VALUES (
+        '75757575-1010-4010-8010-101010101010', ${fixture.agentId},
+        ${viewerAccountId}, 'use', ${fixture.accountId}
+      )
+    `;
+    await expect(repository.loadSessionSnapshot({
+      actor: viewer,
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject({ sessionId: session.sessionId });
+    await expect(repository.markRuntimeSessionUnavailable({
+      actor: viewer,
+      sessionId: session.sessionId,
+      error: 'viewer-cannot-write',
+    })).rejects.toThrow('Unauthorized control-plane operation');
+  });
+
+  it('reconciles only orphaned active Runs and reports the actual update count', async () => {
+    const { prepared } = await prepareRuntimeRun({ suffix: 'orphan-reconciliation' });
+    const terminalRunId = '76767676-1010-4010-8010-101010101010';
+    await sql`
+      INSERT INTO runs (
+        id, session_id, agent_binding_id, config_revision_id, trigger_message_id,
+        idempotency_key, status, runtime_run_ref, model_snapshot,
+        tool_policy_snapshot, context_policy_snapshot, completed_at
+      )
+      SELECT ${terminalRunId}, session_id, agent_binding_id, config_revision_id,
+        trigger_message_id, 'terminal-control', 'succeeded', 'terminal-runtime-ref',
+        model_snapshot, tool_policy_snapshot, context_policy_snapshot, now()
+      FROM runs WHERE id = ${prepared.runId}
+    `;
+
+    await expect(repository.reconcileOrphanedRuns()).resolves.toBe(1);
+    await expect(repository.reconcileOrphanedRuns()).resolves.toBe(0);
+    const states = await sql<{
+      id: string;
+      status: string;
+      error_message: string | null;
+    }[]>`
+      SELECT id, status::text AS status, error_message
+      FROM runs
+      WHERE id IN (${prepared.runId}, ${terminalRunId})
+      ORDER BY id
+    `;
+    expect(states).toEqual([
+      {
+        id: prepared.runId,
+        status: 'reconciling',
+        error_message: 'event_pump_missing_after_restart',
+      },
+      { id: terminalRunId, status: 'succeeded', error_message: null },
+    ].sort((left, right) => left.id.localeCompare(right.id)));
+  });
+
+  it('allows viewer reads while rejecting viewer and outsider Runtime state writes', async () => {
+    const { fixture, session, prepared } = await prepareRuntimeRun({
+      suffix: 'runtime-authorization',
+    });
+    await repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'authorization-event',
+        eventType: 'assistant.delta',
+        payload: { visible: true },
+        occurredAt: '2026-07-18T05:00:00.000Z',
+      },
+    });
+    const viewerAccountId = '78787878-1010-4010-8010-101010101010';
+    const viewer = { accountId: viewerAccountId, authSubject: 'local:runtime-viewer' };
+    await sql`
+      INSERT INTO accounts (id, auth_subject, display_name)
+      VALUES (${viewerAccountId}, ${viewer.authSubject}, 'Runtime viewer')
+    `;
+    await sql`
+      INSERT INTO workspace_members (workspace_id, account_id, role)
+      VALUES (${fixture.workspaceId}, ${viewerAccountId}, 'viewer')
+    `;
+    await sql`
+      INSERT INTO agent_access_grants (
+        id, agent_id, account_id, role, granted_by_account_id
+      ) VALUES (
+        '79797979-1010-4010-8010-101010101010', ${fixture.agentId},
+        ${viewerAccountId}, 'use', ${fixture.accountId}
+      )
+    `;
+
+    await expect(repository.listRunEvents({
+      actor: viewer,
+      runId: prepared.runId,
+      after: 0,
+    })).resolves.toMatchObject([{ runtimeEventKey: 'authorization-event' }]);
+    await expect(repository.loadSessionSnapshot({
+      actor: viewer,
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject({ sessionId: session.sessionId });
+    await expect(repository.ingestRuntimeEvent({
+      actor: viewer,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'viewer-write',
+        eventType: 'assistant.delta',
+        payload: {},
+        occurredAt: '2026-07-18T05:00:01.000Z',
+      },
+    })).rejects.toThrow('Unauthorized control-plane operation');
+    await expect(repository.syncRuntimeSessionHistory({
+      actor: viewer,
+      sessionId: session.sessionId,
+      historyDigest: 'viewer-write',
+    })).rejects.toThrow('Unauthorized control-plane operation');
+    await expect(repository.markRuntimeSessionUnavailable({
+      actor: viewer,
+      sessionId: session.sessionId,
+      error: 'viewer-write',
+    })).rejects.toThrow('Unauthorized control-plane operation');
+    await expect(repository.markRunReconciling({
+      actor: viewer,
+      runId: prepared.runId,
+      error: 'viewer-write',
+    })).rejects.toThrow('Unauthorized control-plane operation');
+
+    const outsider = {
+      accountId: '80808080-1010-4010-8010-101010101010',
+      authSubject: 'local:runtime-outsider',
+    };
+    await sql`
+      INSERT INTO accounts (id, auth_subject, display_name)
+      VALUES (${outsider.accountId}, ${outsider.authSubject}, 'Runtime outsider')
+    `;
+    await expect(repository.listRunEvents({
+      actor: outsider,
+      runId: prepared.runId,
+      after: 0,
+    })).rejects.toThrow('Unauthorized control-plane operation');
+    await expect(repository.loadSessionSnapshot({
+      actor: outsider,
+      sessionId: session.sessionId,
+    })).rejects.toThrow('Unauthorized control-plane operation');
+  });
+
+  it('never regresses a terminal Run back to reconciliation', async () => {
+    const { fixture, prepared } = await prepareRuntimeRun({
+      suffix: 'terminal-reconciliation',
+    });
+    await repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'terminal-failure',
+        eventType: 'run.failed',
+        payload: { error: 'runtime-failure' },
+        occurredAt: '2026-07-18T05:10:00.000Z',
+        terminal: {
+          status: 'failed',
+          errorCode: 'runtime_failure',
+          errorMessage: 'runtime-failure',
+        },
+      },
+    });
+    await expect(repository.markRunReconciling({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      error: 'must-not-regress',
+    })).rejects.toMatchObject({
+      name: 'RunStateConflictError',
+      code: 'run_state_conflict',
+    });
+    const [run] = await sql<{ status: string; error_message: string | null }[]>`
+      SELECT status::text AS status, error_message
+      FROM runs WHERE id = ${prepared.runId}
+    `;
+    expect(run).toEqual({ status: 'failed', error_message: 'runtime-failure' });
   });
 });

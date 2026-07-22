@@ -208,6 +208,7 @@ export const runEvents = pgTable(
     payload: jsonb('payload').notNull(),
     externalEventRef: text('external_event_ref'),
     runtimeEventKey: text('runtime_event_key').notNull(),
+    eventFingerprint: text('event_fingerprint').notNull(),
     occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull(),
     ingestedAt: timestamp('ingested_at', { withTimezone: true }).notNull().defaultNow(),
   },

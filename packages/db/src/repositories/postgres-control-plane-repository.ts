@@ -38,13 +38,21 @@ import {
 import {
   ActiveRunConflictError,
   RunIdempotencyConflictError,
+  RuntimeEventConflictError,
+  RunRuntimeContextUnavailableError,
+  RunStateConflictError,
+  type PersistableRunEvent,
   type PreparedRun,
   type PrepareRunInput,
   type RuntimeBindingSnapshot,
   type RuntimeContextSnapshot,
   type RuntimeModelSnapshot,
+  type RuntimeRunAttachment,
+  type RunRuntimeContext,
   type RuntimeToolPolicySnapshot,
+  type StoredRunEvent,
   type StoredRunStatus,
+  type StoredSessionSnapshot,
 } from './control-plane-run-types';
 
 interface CanonicalPayload {
@@ -173,6 +181,25 @@ interface ReceiptAuthorizationRow {
   agent_binding_id: string;
   session_id: string;
   run_id: string | null;
+}
+
+interface AuthorizedRunRow extends AuthorizationRow {
+  run_id: string;
+  session_id: string;
+  status: StoredRunStatus;
+  runtime_run_ref: string | null;
+  external_session_ref: string | null;
+}
+
+interface StoredRunEventRow {
+  run_id: string;
+  sequence: number;
+  event_type: string;
+  payload: unknown;
+  external_event_ref: string | null;
+  runtime_event_key: string;
+  event_fingerprint: string;
+  occurred_at: Date;
 }
 
 interface CompensationRow {
@@ -991,6 +1018,92 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           JOIN agent_bindings binding ON binding.id = session.agent_binding_id
           JOIN agents agent ON agent.id = binding.agent_id AND agent.status = 'active'
           WHERE session.id = ${sessionId}
+            AND member.role = ANY(${allowedRoles})
+            AND binding.status IN ('ready', 'degraded')
+            AND (
+              agent.owner_account_id = account.id
+              OR EXISTS (
+                SELECT 1 FROM agent_access_grants access_grant
+                WHERE access_grant.agent_id = agent.id
+                  AND access_grant.account_id = account.id
+                  AND access_grant.revoked_at IS NULL
+              )
+            )
+        `;
+    const [authorized] = await query;
+    if (!authorized) throw new AuthorizationError();
+    return authorized;
+  }
+
+  private async authorizeRun(
+    tx: postgres.TransactionSql,
+    actor: ActorContext,
+    runId: string,
+    options: { lock?: boolean; write?: boolean } = {},
+  ): Promise<AuthorizedRunRow> {
+    const allowedRoles = options.write
+      ? ['owner', 'editor', 'runner']
+      : ['owner', 'editor', 'runner', 'viewer'];
+    const query = options.lock
+      ? tx<AuthorizedRunRow[]>`
+          SELECT workflow.id AS workflow_id, workflow.workspace_id,
+            binding.id AS agent_binding_id, binding.agent_id,
+            binding.runtime_kind::text AS runtime_kind, binding.isolation_key,
+            binding.endpoint_ref, binding.secret_ref,
+            run.id AS run_id, run.session_id, run.status::text AS status,
+            run.runtime_run_ref, runtime_ref.external_session_ref
+          FROM runs run
+          JOIN sessions session ON session.id = run.session_id
+          JOIN workflows workflow ON workflow.id = session.workflow_id
+          JOIN accounts account
+            ON account.id = ${actor.accountId}
+           AND account.auth_subject = ${actor.authSubject}
+          JOIN workspace_members member
+            ON member.workspace_id = workflow.workspace_id
+           AND member.account_id = account.id
+          JOIN agent_bindings binding ON binding.id = run.agent_binding_id
+          JOIN agents agent ON agent.id = binding.agent_id AND agent.status = 'active'
+          LEFT JOIN session_runtime_refs runtime_ref
+            ON runtime_ref.session_id = session.id
+           AND runtime_ref.is_primary = true
+           AND runtime_ref.status = 'active'
+          WHERE run.id = ${runId}
+            AND member.role = ANY(${allowedRoles})
+            AND binding.status IN ('ready', 'degraded')
+            AND (
+              agent.owner_account_id = account.id
+              OR EXISTS (
+                SELECT 1 FROM agent_access_grants access_grant
+                WHERE access_grant.agent_id = agent.id
+                  AND access_grant.account_id = account.id
+                  AND access_grant.revoked_at IS NULL
+              )
+            )
+          FOR UPDATE OF run
+        `
+      : tx<AuthorizedRunRow[]>`
+          SELECT workflow.id AS workflow_id, workflow.workspace_id,
+            binding.id AS agent_binding_id, binding.agent_id,
+            binding.runtime_kind::text AS runtime_kind, binding.isolation_key,
+            binding.endpoint_ref, binding.secret_ref,
+            run.id AS run_id, run.session_id, run.status::text AS status,
+            run.runtime_run_ref, runtime_ref.external_session_ref
+          FROM runs run
+          JOIN sessions session ON session.id = run.session_id
+          JOIN workflows workflow ON workflow.id = session.workflow_id
+          JOIN accounts account
+            ON account.id = ${actor.accountId}
+           AND account.auth_subject = ${actor.authSubject}
+          JOIN workspace_members member
+            ON member.workspace_id = workflow.workspace_id
+           AND member.account_id = account.id
+          JOIN agent_bindings binding ON binding.id = run.agent_binding_id
+          JOIN agents agent ON agent.id = binding.agent_id AND agent.status = 'active'
+          LEFT JOIN session_runtime_refs runtime_ref
+            ON runtime_ref.session_id = session.id
+           AND runtime_ref.is_primary = true
+           AND runtime_ref.status = 'active'
+          WHERE run.id = ${runId}
             AND member.role = ANY(${allowedRoles})
             AND binding.status IN ('ready', 'degraded')
             AND (
@@ -2551,6 +2664,16 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           completed_at = NULL
         WHERE id = ${receipt.id}
       `;
+      if (receipt.run_id !== null) {
+        const [run] = await tx<{ id: string }[]>`
+          UPDATE runs
+          SET status = 'queued', error_code = NULL, error_message = NULL,
+            completed_at = NULL
+          WHERE id = ${receipt.run_id} AND status IN ('queued', 'failed')
+          RETURNING id
+        `;
+        if (!run) throw new Error('Runtime dispatch lease cannot reset its Run');
+      }
       return { phase: 'runtime_dispatched', dispatchAllowed: true };
     });
   }
@@ -2630,6 +2753,419 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     });
   }
 
+  async attachRuntimeRun(input: {
+    actor: ActorContext;
+    commandReceiptId: string;
+    runtimeRun: RuntimeRunAttachment;
+  }): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      const receipt = await this.authorizeReceipt(
+        tx,
+        input.actor,
+        input.commandReceiptId,
+      );
+      if (receipt.result_type !== 'run' || receipt.run_id === null) {
+        throw new Error('Command receipt does not describe a Run');
+      }
+      if (!input.runtimeRun.externalRunRef.trim()) {
+        throw new Error('Runtime Run reference must not be empty');
+      }
+      const acceptedAt = new Date(input.runtimeRun.acceptedAt);
+      if (Number.isNaN(acceptedAt.getTime())) {
+        throw new Error('Runtime Run acceptedAt must be an ISO timestamp');
+      }
+
+      const [run] = await tx<{
+        runtime_run_ref: string | null;
+      }[]>`
+        SELECT runtime_run_ref
+        FROM runs
+        WHERE id = ${receipt.run_id}
+        FOR UPDATE
+      `;
+      if (!run) throw new AuthorizationError();
+      if (
+        run.runtime_run_ref !== null
+        && run.runtime_run_ref !== input.runtimeRun.externalRunRef
+      ) {
+        throw new Error('Runtime Run reference conflicts with attached Run');
+      }
+      if (receipt.orchestration_phase === 'attached') {
+        if (
+          receipt.external_resource_kind !== 'run'
+          || receipt.external_resource_ref !== input.runtimeRun.externalRunRef
+          || run.runtime_run_ref !== input.runtimeRun.externalRunRef
+        ) {
+          throw new Error('Runtime Run reference conflicts with attached receipt');
+        }
+        return;
+      }
+      if (!['runtime_known', 'reconciling'].includes(receipt.orchestration_phase)) {
+        throw new Error(`Runtime Run cannot attach from ${receipt.orchestration_phase}`);
+      }
+      if (
+        receipt.external_resource_kind !== null
+        && receipt.external_resource_kind !== 'run'
+      ) {
+        throw new Error('Runtime resource kind conflicts with Run attach');
+      }
+      if (
+        receipt.external_resource_ref !== null
+        && receipt.external_resource_ref !== input.runtimeRun.externalRunRef
+      ) {
+        throw new Error('Runtime Run reference conflicts with recorded resource');
+      }
+
+      const [updatedRun] = await tx<{ id: string }[]>`
+        UPDATE runs
+        SET runtime_run_ref = COALESCE(runtime_run_ref, ${input.runtimeRun.externalRunRef}),
+          status = CASE WHEN status = 'queued' THEN 'running'::run_status ELSE status END,
+          started_at = COALESCE(started_at, ${acceptedAt}),
+          error_code = CASE WHEN status = 'queued' THEN NULL ELSE error_code END,
+          error_message = CASE WHEN status = 'queued' THEN NULL ELSE error_message END,
+          completed_at = CASE WHEN status = 'queued' THEN NULL ELSE completed_at END
+        WHERE id = ${receipt.run_id}
+          AND (runtime_run_ref IS NULL OR runtime_run_ref = ${input.runtimeRun.externalRunRef})
+        RETURNING id
+      `;
+      if (!updatedRun) {
+        throw new Error('Runtime Run could not be attached');
+      }
+      await tx`
+        UPDATE command_receipts
+        SET orchestration_phase = 'attached', external_resource_kind = 'run',
+          external_resource_ref = ${input.runtimeRun.externalRunRef},
+          last_error = NULL, completed_at = now()
+        WHERE id = ${receipt.id}
+      `;
+      await tx`
+        UPDATE runtime_compensations
+        SET external_resource_ref = COALESCE(
+              external_resource_ref, ${input.runtimeRun.externalRunRef}
+            ),
+          status = 'succeeded', attempts = attempts + 1, last_error = NULL,
+          resolution_evidence = ${tx.json({
+            outcome: 'adopted',
+            path: 'normal-command',
+            externalRunRef: input.runtimeRun.externalRunRef,
+          })},
+          resolved_at = now(), updated_at = now()
+        WHERE command_receipt_id = ${receipt.id}
+          AND external_resource_kind = 'run' AND action = 'adopt'
+          AND status <> 'succeeded'
+      `;
+    });
+  }
+
+  async ingestRuntimeEvent(input: {
+    actor: ActorContext;
+    runId: string;
+    event: PersistableRunEvent;
+  }): Promise<StoredRunEvent> {
+    return this.sql.begin(async (tx) => {
+      const eventFingerprint = toCanonicalPayload(input.event).hash;
+      const run = await this.authorizeRun(tx, input.actor, input.runId, {
+        lock: true,
+        write: true,
+      });
+      const [existing] = await tx<StoredRunEventRow[]>`
+        SELECT run_id, sequence::integer AS sequence, event_type, payload,
+          external_event_ref, runtime_event_key, event_fingerprint, occurred_at
+        FROM run_events
+        WHERE run_id = ${input.runId}
+          AND runtime_event_key = ${input.event.runtimeEventKey}
+      `;
+      if (existing) {
+        if (existing.event_fingerprint !== eventFingerprint) {
+          throw new RuntimeEventConflictError(input.event.runtimeEventKey);
+        }
+        return {
+          runId: existing.run_id,
+          sequence: existing.sequence,
+          eventType: existing.event_type,
+          payload: existing.payload,
+          externalEventRef: existing.external_event_ref,
+          runtimeEventKey: existing.runtime_event_key,
+          occurredAt: new Date(existing.occurred_at).toISOString(),
+        };
+      }
+      if (['succeeded', 'failed', 'cancelled'].includes(run.status)) {
+        throw new Error('Run is terminal and cannot accept a new Runtime event');
+      }
+      const [next] = await tx<{ sequence: number }[]>`
+        SELECT (COALESCE(MAX(sequence), 0) + 1)::integer AS sequence
+        FROM run_events
+        WHERE run_id = ${input.runId}
+      `;
+      if (!next) throw new Error('Next Run event sequence is unavailable');
+      const [stored] = await tx<StoredRunEventRow[]>`
+        INSERT INTO run_events (
+          id, run_id, sequence, event_type, payload, external_event_ref,
+          runtime_event_key, event_fingerprint, occurred_at
+        ) VALUES (
+          ${randomUUID()}, ${input.runId}, ${next.sequence}, ${input.event.eventType},
+          ${tx.json(input.event.payload as postgres.JSONValue)},
+          ${input.event.externalEventRef ?? null}, ${input.event.runtimeEventKey},
+          ${eventFingerprint}, ${input.event.occurredAt}
+        )
+        RETURNING run_id, sequence::integer AS sequence, event_type, payload,
+          external_event_ref, runtime_event_key, event_fingerprint, occurred_at
+      `;
+      if (!stored) throw new Error('Runtime event was not stored');
+
+      if (input.event.message) {
+        const [lockedSession] = await tx<{ id: string }[]>`
+          SELECT id FROM sessions WHERE id = ${run.session_id} FOR UPDATE
+        `;
+        if (!lockedSession) throw new AuthorizationError();
+        const [nextMessage] = await tx<{ ordinal: number }[]>`
+          SELECT (COALESCE(MAX(ordinal), -1) + 1)::integer AS ordinal
+          FROM messages
+          WHERE session_id = ${run.session_id}
+        `;
+        if (!nextMessage) throw new Error('Next Session Message ordinal is unavailable');
+        await tx`
+          INSERT INTO messages (
+            id, workflow_id, session_id, run_id, ordinal, role,
+            actor_account_id, actor_agent_id, content, status,
+            external_message_ref, source_runtime_event_key
+          ) VALUES (
+            ${randomUUID()}, ${run.workflow_id}, ${run.session_id}, ${input.runId},
+            ${nextMessage.ordinal}, ${input.event.message.role}, NULL,
+            ${run.agent_id},
+            ${tx.json(input.event.message.content as postgres.JSONValue)}, 'completed',
+            ${input.event.message.externalMessageRef ?? null},
+            ${input.event.runtimeEventKey}
+          )
+          ON CONFLICT (run_id, source_runtime_event_key)
+            WHERE source_runtime_event_key IS NOT NULL
+          DO NOTHING
+        `;
+      }
+
+      if (input.event.terminal) {
+        const [updated] = await tx<{ id: string }[]>`
+          UPDATE runs
+          SET status = ${input.event.terminal.status},
+            error_code = ${input.event.terminal.errorCode ?? null},
+            error_message = ${input.event.terminal.errorMessage ?? null},
+            completed_at = now()
+          WHERE id = ${input.runId}
+            AND status IN ('queued', 'running', 'waiting_approval', 'reconciling')
+          RETURNING id
+        `;
+        if (!updated) {
+          throw new Error('Run terminal state could not be committed');
+        }
+      }
+
+      return {
+        runId: stored.run_id,
+        sequence: stored.sequence,
+        eventType: stored.event_type,
+        payload: stored.payload,
+        externalEventRef: stored.external_event_ref,
+        runtimeEventKey: stored.runtime_event_key,
+        occurredAt: new Date(stored.occurred_at).toISOString(),
+      };
+    });
+  }
+
+  async listRunEvents(input: {
+    actor: ActorContext;
+    runId: string;
+    after: number;
+    limit?: number;
+  }): Promise<StoredRunEvent[]> {
+    if (!Number.isSafeInteger(input.after) || input.after < 0) {
+      throw new Error('Run event cursor must be a non-negative safe integer');
+    }
+    const limit = input.limit ?? 100;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error('Run event limit must be an integer between 1 and 100');
+    }
+    return this.sql.begin(async (tx) => {
+      await this.authorizeRun(tx, input.actor, input.runId);
+      const rows = await tx<StoredRunEventRow[]>`
+        SELECT run_id, sequence::integer AS sequence, event_type, payload,
+          external_event_ref, runtime_event_key, occurred_at
+        FROM run_events
+        WHERE run_id = ${input.runId} AND sequence > ${input.after}
+        ORDER BY sequence
+        LIMIT ${limit}
+      `;
+      return rows.map((row) => ({
+        runId: row.run_id,
+        sequence: row.sequence,
+        eventType: row.event_type,
+        payload: row.payload,
+        externalEventRef: row.external_event_ref,
+        runtimeEventKey: row.runtime_event_key,
+        occurredAt: new Date(row.occurred_at).toISOString(),
+      }));
+    });
+  }
+
+  async getRunRuntimeContext(input: {
+    actor: ActorContext;
+    runId: string;
+  }): Promise<RunRuntimeContext> {
+    return this.sql.begin(async (tx) => {
+      const run = await this.authorizeRun(tx, input.actor, input.runId);
+      if (run.external_session_ref === null || run.runtime_run_ref === null) {
+        throw new RunRuntimeContextUnavailableError();
+      }
+      return {
+        actor: input.actor,
+        workflowId: run.workflow_id,
+        sessionId: run.session_id,
+        runId: run.run_id,
+        status: run.status,
+        binding: {
+          canvasAgentBindingId: run.agent_binding_id,
+          agentId: run.agent_id,
+          runtimeKind: run.runtime_kind,
+          isolationKey: run.isolation_key,
+          ...(run.endpoint_ref === null ? {} : { endpointRef: run.endpoint_ref }),
+          ...(run.secret_ref === null ? {} : { secretRef: run.secret_ref }),
+        },
+        externalSessionRef: run.external_session_ref,
+        externalRunRef: run.runtime_run_ref,
+      };
+    });
+  }
+
+  async syncRuntimeSessionHistory(input: {
+    actor: ActorContext;
+    sessionId: string;
+    historyDigest: string;
+  }): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      await this.authorizeSession(tx, input.actor, input.sessionId, { write: true });
+      const [runtimeRef] = await tx<{ id: string }[]>`
+        UPDATE session_runtime_refs
+        SET metadata = metadata || ${tx.json({ historyDigest: input.historyDigest })},
+          updated_at = now()
+        WHERE session_id = ${input.sessionId}
+          AND is_primary = true AND status = 'active'
+        RETURNING id
+      `;
+      if (!runtimeRef) {
+        throw new Error('Session has no active primary Runtime reference');
+      }
+    });
+  }
+
+  async markRuntimeSessionUnavailable(input: {
+    actor: ActorContext;
+    sessionId: string;
+    error: string;
+  }): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      await this.authorizeSession(tx, input.actor, input.sessionId, { write: true });
+      const [runtimeRef] = await tx<{ id: string }[]>`
+        UPDATE session_runtime_refs
+        SET status = 'error',
+          metadata = metadata || ${tx.json({ lastError: input.error })},
+          updated_at = now()
+        WHERE session_id = ${input.sessionId}
+          AND is_primary = true AND status = 'active'
+        RETURNING id
+      `;
+      if (!runtimeRef) {
+        throw new Error('Session has no active primary Runtime reference');
+      }
+    });
+  }
+
+  async markRunReconciling(input: {
+    actor: ActorContext;
+    runId: string;
+    error: string;
+  }): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      const run = await this.authorizeRun(tx, input.actor, input.runId, {
+        lock: true,
+        write: true,
+      });
+      if (['succeeded', 'failed', 'cancelled'].includes(run.status)) {
+        throw new RunStateConflictError('A terminal Run cannot enter reconciliation');
+      }
+      const [updated] = await tx<{ id: string }[]>`
+        UPDATE runs
+        SET status = 'reconciling', error_message = ${input.error},
+          completed_at = NULL
+        WHERE id = ${input.runId}
+          AND status IN ('queued', 'running', 'waiting_approval', 'reconciling')
+        RETURNING id
+      `;
+      if (!updated) throw new RunStateConflictError('Run cannot enter reconciliation');
+    });
+  }
+
+  async loadSessionSnapshot(input: {
+    actor: ActorContext;
+    sessionId: string;
+  }): Promise<StoredSessionSnapshot> {
+    return this.sql.begin(async (tx) => {
+      await tx`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`;
+      await this.authorizeSession(tx, input.actor, input.sessionId);
+      const [session] = await tx<{ status: string }[]>`
+        SELECT status::text AS status FROM sessions WHERE id = ${input.sessionId}
+      `;
+      if (!session) throw new AuthorizationError();
+      const messages = await this.loadTranscriptProjection(tx, input.sessionId);
+      const [activeRun] = await tx<{
+        run_id: string;
+        status: StoredRunStatus;
+      }[]>`
+        SELECT id AS run_id, status::text AS status
+        FROM runs
+        WHERE session_id = ${input.sessionId}
+          AND status IN ('queued', 'running', 'waiting_approval', 'reconciling')
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `;
+      const [runtimeRef] = await tx<{
+        external_session_ref: string;
+        status: 'active' | 'historical' | 'error';
+      }[]>`
+        SELECT external_session_ref, status
+        FROM session_runtime_refs
+        WHERE session_id = ${input.sessionId} AND is_primary = true
+          AND status IN ('active', 'historical', 'error')
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT 1
+      `;
+      return {
+        sessionId: input.sessionId,
+        status: session.status,
+        messages,
+        activeRun: activeRun
+          ? { runId: activeRun.run_id, status: activeRun.status }
+          : null,
+        runtimeRef: runtimeRef
+          ? {
+              externalSessionRef: runtimeRef.external_session_ref,
+              status: runtimeRef.status,
+            }
+          : null,
+      };
+    });
+  }
+
+  async reconcileOrphanedRuns(): Promise<number> {
+    const updated = await this.sql<{ id: string }[]>`
+      UPDATE runs
+      SET status = 'reconciling',
+        error_message = 'event_pump_missing_after_restart',
+        completed_at = NULL
+      WHERE status IN ('queued', 'running', 'waiting_approval')
+      RETURNING id
+    `;
+    return updated.length;
+  }
+
   async markRuntimeCommandFailure(input: RuntimeCommandFailureInput): Promise<void> {
     await this.sql.begin(async (tx) => {
       const receipt = await this.authorizeReceipt(
@@ -2637,6 +3173,15 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         input.actor,
         input.commandReceiptId,
       );
+      if (receipt.run_id !== null) {
+        await tx`
+          UPDATE runs
+          SET status = 'failed', error_code = NULL,
+            error_message = ${input.error}, completed_at = now()
+          WHERE id = ${receipt.run_id}
+            AND status IN ('queued', 'running', 'waiting_approval', 'reconciling')
+        `;
+      }
       if (
         receipt.orchestration_phase === 'attached'
         || receipt.orchestration_phase === 'terminal_failure'
@@ -2721,6 +3266,17 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         ...receipt.external_lookup_metadata,
         ...this.compensationMetadata(receipt, input.lookupMetadata),
       };
+      if (receipt.run_id !== null) {
+        const [run] = await tx<{ id: string }[]>`
+          UPDATE runs
+          SET status = 'reconciling', error_message = ${input.error},
+            completed_at = NULL
+          WHERE id = ${receipt.run_id}
+            AND status IN ('queued', 'running', 'waiting_approval', 'reconciling')
+          RETURNING id
+        `;
+        if (!run) throw new Error('Runtime reconciliation cannot update its active Run');
+      }
       await tx`
         UPDATE command_receipts
         SET orchestration_phase = 'reconciling',
