@@ -1,89 +1,94 @@
 # AI Super Canvas / AI 超级画板
 
-AI 超级画板是一个面向 AI 原生工作流的**图谱式 / 有机式智能画布**。
+AI 超级画板是一个面向 AI 原生工作流的图谱式、有机式智能画布。它把线性 Chat 扩展为可分枝、可回流、可代谢、可重构的会话空间，并以一张统一画布承载创意、资产、任务、复盘和历史。
 
-它的第一项核心功能不是绘图本身，而是把传统线性 Chat 转化为一个可分枝、可回流、可代谢、可重构的会话空间。用户可以从任意词汇、句子、段落、图片素材、文件片段、画布节点或局部区域生成分支，在独立上下文中探索，并将有效结果回流到主线或其它相关节点。
+> **Prototype status:** The current browser UI is a **localStorage prototype**. Workspace state stays in that browser, the visible AI behavior is a deterministic demo, and the UI is not yet connected to PostgreSQL, external model providers, multi-user synchronization, or the control-plane persistence layer.
 
-## 核心定位
+The repository also contains the database control plane and Runtime adapter contracts that are being hardened independently of the prototype UI. Do not treat the current screen as a production-ready or server-persisted application.
 
-> AI 超级画板的第一个功能，是让 AI 对话从线性消息流变成可分枝、可回流、可代谢的有机图谱式会话空间。
+## Product direction
 
-## 统一工作台原则
+The first product slice is **Feature 01: graph-based / organic conversation canvas**. Users can select text in the trunk, create an anchored branch, explore it independently, turn useful results into conclusion cards, and explicitly reintegrate those cards into a new trunk revision.
 
-AI 超级画板不是多个工作台的拼接，而是一张统一的有机式 AI 工作画布。
+The longer-term foundation includes AI image workflows, structured asset generation, presentation workflows, CAD agents, multi-agent orchestration, and durable project memory. Focus modes change emphasis inside the same canvas; they do not create separate workspaces.
 
-> **工作台只有一个，但在同一个工作台里存在不同功能侧重点。**
+## Architecture
 
-TapNow 类节点生成、素材管理、历史版本和 Workflow 能力，属于这张统一画布中的“创意执行侧重点”，不是另一个下级工作台，也不是 AI 超级画板的产品母体。
+Each canvas Chat block is designed to become a persistent `SessionNode/Session`. A Workflow contains branchable Sessions, each execution is a distinct Run, and the control plane uses replaceable Runtime adapters.
 
-建议的焦点模式：
+- [Architecture index](docs/architecture/README.md)
+- [Control-plane and Runtime adapter ADR](docs/architecture/adr/0001-canvas-control-plane-and-runtime-adapters.md)
+- [Agent and Session domain model](docs/architecture/agent-session-domain-model.md)
+- [PostgreSQL schema](docs/architecture/postgres-schema.md)
+- [Runtime adapter contract](docs/architecture/runtime-adapter-contract.md)
+- [Hermes ACP capability gates](docs/architecture/hermes-acp-capability-gates.md)
+- [Development roadmap](docs/architecture/development-roadmap.md)
+- [Deep repository review dated 2026-07-22](docs/reviews/2026-07-22-deep-repository-review.md)
 
-```text
-生长 | 创意 | 资产 | 任务 | 复盘 | 历史
+## Prerequisites
+
+- Node.js 24.18.0
+- pnpm 11.12.0
+- Docker Engine with Docker Compose v2
+- Git
+
+## Bootstrap for local development
+
+```bash
+git clone https://github.com/ArchitectureWorld/ai-super-canvas.git
+cd ai-super-canvas
+cp .env.example .env
+pnpm install --frozen-lockfile
+pnpm dev
 ```
 
-焦点模式只改变同一画布中对象的显示权重和操作入口，不改变对象归属。
+Review `.env` before starting services. At minimum, replace `POSTGRES_PASSWORD` with a long URL-safe random value. Provider keys such as `OPENAI_API_KEY` are optional for the current prototype and must never be committed.
 
-## 第一阶段目标
+Open `http://127.0.0.1:3000` after the development server starts.
 
-当前仓库优先沉淀 **Feature 01：图谱式 / 有机式会话画布**。
+## Docker bootstrap
 
-这一功能将成为后续能力的空间底座，包括：
-
-- AI 绘图与多方案分支
-- 图像分层与 PSD / PPT 还原
-- PPT 生成与审美确认流程
-- Rhino / Grasshopper 看图建模工作流
-- Hermes / OpenClaw / Codex 等 Agent 协作
-- 项目知识沉淀、稳定结论与长期记忆
-
-## 当前架构主线
-
-每个画布 Chat 块将演进为一个持久化 `SessionNode/Session`；登录账号默认绑定长期个人 Agent，一个 Workflow 由多个可分枝 Session 组成，每次执行记录为独立 Run。
-
-产品采用“Canvas Agent 控制面 + 可替换 Runtime”架构：Hermes ACP 是第一代候选 Runtime，Letta 是备用候选，二者都必须通过统一契约和隔离测试。权威入口见 [`docs/architecture/README.md`](docs/architecture/README.md)。
-
-## 当前文档结构
-
-```text
-.
-├─ README.md
-├─ docs/
-│  ├─ 00-project-overview.md
-│  ├─ 01-organic-graph-chat.md
-│  ├─ 02-product-roadmap.md
-│  ├─ 03-data-model.md
-│  ├─ 04-glossary.md
-│  ├─ 05-ui-direction.md
-│  ├─ 06-unified-workspace-model.md
-│  ├─ architecture/
-│  │  ├─ README.md
-│  │  ├─ adr/
-│  │  │  └─ 0001-canvas-control-plane-and-runtime-adapters.md
-│  │  ├─ agent-session-domain-model.md
-│  │  ├─ postgres-schema.md
-│  │  ├─ runtime-adapter-contract.md
-│  │  ├─ hermes-acp-capability-gates.md
-│  │  └─ development-roadmap.md
-│  └─ superpowers/
-│     ├─ specs/
-│     └─ plans/
-└─ packages/
-   ├─ core/
-   ├─ ai/
-   └─ db/
+```bash
+cp .env.example .env
+# Replace POSTGRES_PASSWORD in .env before continuing.
+docker compose up --build --detach
+curl --fail http://127.0.0.1:3000/api/health
 ```
 
-## 关键词
+Stop the stack without deleting the persistent PostgreSQL volume:
 
-- 图谱式会话 Graph-based Conversation
-- 有机式会话 Organic Conversation
-- 统一工作台 Unified Workspace
-- 焦点模式 Focus Mode
-- 语义锚点 Semantic Anchor
-- 分枝 Branching
-- 回流 Feedback / Reintegration
-- 剪枝 Pruning
-- 落叶 Decay
-- 腐殖化 Humification
-- 主线重构 Trunk Reconstruction
+```bash
+docker compose down
+```
+
+The current `/api/health` route is a web liveness signal. Database-backed readiness is a documented follow-up.
+
+## Commands and test status
+
+| Area | Exact command | Status and purpose |
+| --- | --- | --- |
+| Install | `pnpm install --frozen-lockfile` | Reproducible workspace bootstrap from the tracked lockfile |
+| Development | `pnpm dev` | Starts the local Next.js UI |
+| Lint | `pnpm lint` | Required static-analysis gate |
+| Typecheck | `pnpm typecheck` | Required TypeScript gate |
+| Unit and contract tests | `pnpm test` | Required deterministic unit/contract gate |
+| Database integration | `pnpm test:integration:docker` | Authoritative disposable integration gate; requires Docker |
+| Production dependency audit | `pnpm audit --prod --audit-level moderate` | Required production advisory gate |
+| Build | `pnpm build` | Required workspace production build |
+| Browser E2E | `pnpm test:e2e` | Defined, but not yet a required or verified passing gate |
+
+The tracked `Quality` workflow defines `verify` and `integration` jobs. CodeQL runs JavaScript/TypeScript analysis on `main`, pull requests, and a weekly schedule. See the dated [deep repository review](docs/reviews/2026-07-22-deep-repository-review.md) for evidence counts and the distinction between local verification and public CI runs.
+
+## Contributing and security
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change.
+
+For security reports, do not open a public issue. Follow [SECURITY.md](SECURITY.md) and contact [@ArchitectureWorld](https://github.com/ArchitectureWorld) through the private reporting route described there.
+
+## Keywords
+
+- Graph-based Conversation / 图谱式会话
+- Organic Conversation / 有机式会话
+- Unified Workspace / 统一工作台
+- Semantic Anchor / 语义锚点
+- Branching, reintegration, pruning, decay, and trunk reconstruction
