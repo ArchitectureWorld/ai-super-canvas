@@ -11,6 +11,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+pnpm-debug.log*
 
 # Environment
 .env
@@ -28,8 +29,18 @@ dist/
 build/
 out/
 .next/
+coverage/
+playwright-report/
+test-results/
+
+# Local worktrees
+.worktrees/
+worktrees/
 
 # Temporary files
 .tmp/
 tmp/
 .cache/
+*.tsbuildinfo
+.codebase-memory/
+.superpowers/

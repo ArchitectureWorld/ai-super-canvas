@@ -1,0 +1,181 @@
+import type { BranchLifecycle } from '@ai-super-canvas/core';
+
+export interface CanvasPosition {
+  x: number;
+  y: number;
+  pinned: boolean;
+}
+
+export interface CanvasLayoutState {
+  positions: Record<string, CanvasPosition>;
+  modelByNodeId: Record<string, string>;
+  selectedNodeId: string | null;
+  viewport: { x: number; y: number; zoom: number };
+}
+
+export interface CanvasPanGesture {
+  startX: number;
+  startY: number;
+  baseX: number;
+  baseY: number;
+}
+
+export interface ComposerTarget {
+  kind: 'trunk' | 'branch' | 'anchor' | 'outcome';
+  title: string;
+}
+
+export interface CanvasWheelZoomIntentInput {
+  deltaY: number;
+  deltaMode: number;
+  clientX: number;
+  clientY: number;
+  stageRectLeft: number;
+  stageRectTop: number;
+  stageClientLeft: number;
+  stageClientTop: number;
+}
+
+export interface CanvasWheelZoomIntent {
+  delta: number;
+  focalPoint: Pick<CanvasPosition, 'x' | 'y'>;
+}
+
+const wheelPixelsPerLine = 16;
+const wheelPixelsPerPage = 800;
+const wheelPixelsPerZoomStep = 100;
+
+export function initialCanvasLayout(): CanvasLayoutState {
+  return {
+    positions: {},
+    modelByNodeId: {},
+    selectedNodeId: 'trunk',
+    viewport: { x: 0, y: 0, zoom: 1 },
+  };
+}
+
+export function composerTargetLabel(target: ComposerTarget): string {
+  if (target.kind === 'trunk') return '主干';
+  if (target.kind === 'anchor') return `锚点：“${target.title}”`;
+  if (target.kind === 'outcome') return '完善成果';
+  return `分支：${target.title}`;
+}
+
+export function isBranchComposerSubmitDisabled(
+  lifecycle: BranchLifecycle,
+  message: string,
+): boolean {
+  return lifecycle !== 'active' || !message.trim();
+}
+
+export function moveCanvasNode(
+  state: CanvasLayoutState,
+  nodeId: string,
+  position: Pick<CanvasPosition, 'x' | 'y'>,
+): CanvasLayoutState {
+  return {
+    ...state,
+    positions: {
+      ...state.positions,
+      [nodeId]: { ...position, pinned: true },
+    },
+  };
+}
+
+export function normalizeWheelZoomDelta(deltaY: number, deltaMode: number): number {
+  if (deltaY === 0) return 0;
+  const pixelsPerUnit = deltaMode === 1
+    ? wheelPixelsPerLine
+    : deltaMode === 2
+      ? wheelPixelsPerPage
+      : 1;
+  const zoomDelta = -(deltaY * pixelsPerUnit) / wheelPixelsPerZoomStep;
+  return Math.max(-1, Math.min(1, zoomDelta));
+}
+
+export function createCanvasWheelZoomIntent(
+  input: CanvasWheelZoomIntentInput,
+): CanvasWheelZoomIntent | null {
+  const delta = normalizeWheelZoomDelta(input.deltaY, input.deltaMode);
+  if (delta === 0) return null;
+  return {
+    delta,
+    focalPoint: {
+      x: input.clientX - input.stageRectLeft - input.stageClientLeft,
+      y: input.clientY - input.stageRectTop - input.stageClientTop,
+    },
+  };
+}
+
+export function zoomCanvas(
+  state: CanvasLayoutState,
+  delta: number,
+  focalPoint?: Pick<CanvasPosition, 'x' | 'y'>,
+): CanvasLayoutState {
+  const zoom = Math.max(0.55, Math.min(1.45, state.viewport.zoom + delta * 0.1));
+  if (!focalPoint || zoom === state.viewport.zoom) {
+    return { ...state, viewport: { ...state.viewport, zoom } };
+  }
+
+  return {
+    ...state,
+    viewport: {
+      x: focalPoint.x - ((focalPoint.x - state.viewport.x) / state.viewport.zoom) * zoom,
+      y: focalPoint.y - ((focalPoint.y - state.viewport.y) / state.viewport.zoom) * zoom,
+      zoom,
+    },
+  };
+}
+
+export function panCanvas(
+  state: CanvasLayoutState,
+  gesture: CanvasPanGesture,
+  pointer: Pick<CanvasPosition, 'x' | 'y'>,
+): CanvasLayoutState {
+  return {
+    ...state,
+    viewport: {
+      ...state.viewport,
+      x: gesture.baseX + pointer.x - gesture.startX,
+      y: gesture.baseY + pointer.y - gesture.startY,
+    },
+  };
+}
+
+export function resolveCanvasNodeModel(
+  savedModel: string | undefined,
+  catalog: { models: readonly string[]; defaultModel: string },
+): string {
+  return savedModel && catalog.models.includes(savedModel)
+    ? savedModel
+    : catalog.defaultModel;
+}
+
+export function pruneCanvasNodeModels(
+  state: CanvasLayoutState,
+  catalog: { models: readonly string[] },
+): CanvasLayoutState {
+  const availableModels = new Set(catalog.models);
+  const modelEntries = Object.entries(state.modelByNodeId);
+  const availableEntries = modelEntries.filter(([, model]) => availableModels.has(model));
+  if (availableEntries.length === modelEntries.length) return state;
+
+  return {
+    ...state,
+    modelByNodeId: Object.fromEntries(availableEntries),
+  };
+}
+
+export function setCanvasNodeModel(
+  state: CanvasLayoutState,
+  nodeId: string,
+  model: string,
+): CanvasLayoutState {
+  return {
+    ...state,
+    modelByNodeId: {
+      ...state.modelByNodeId,
+      [nodeId]: model,
+    },
+  };
+}

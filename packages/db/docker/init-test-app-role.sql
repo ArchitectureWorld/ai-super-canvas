@@ -1,0 +1,7 @@
+CREATE ROLE canvas_s1_app
+  LOGIN
+  PASSWORD 'canvas-app-password'
+  NOSUPERUSER
+  NOCREATEDB
+  NOCREATEROLE
+  NOREPLICATION;

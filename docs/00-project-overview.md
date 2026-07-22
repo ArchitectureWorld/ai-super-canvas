@@ -1,5 +1,7 @@
 # AI 超级画板项目总览
 
+> 文档状态：产品愿景仍有效。Agent、Session、Run、Runtime 和开发顺序的权威定义见 [`docs/architecture/README.md`](./architecture/README.md)。
+
 ## 1. 项目定位
 
 **AI 超级画板**不是传统绘图软件，也不是普通白板或线性 Chat 工具。它的目标是成为一个面向 AI 原生工作流的**图谱式 / 有机式智能画布**。

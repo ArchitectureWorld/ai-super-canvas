@@ -1,0 +1,105 @@
+name: Quality
+
+on:
+  push:
+    branches:
+      - main
+      - feat/**
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.12.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set +e
+          pnpm install --frozen-lockfile 2>&1 | tee install.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+
+      - name: Upload install diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-diagnostics
+          path: install.log
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Audit production dependencies
+        run: pnpm audit --prod --audit-level moderate
+      - name: Validate Compose file
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+        run: docker compose config --quiet
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build application
+        run: pnpm build
+
+      - name: Build production image
+        run: docker build --tag ai-super-canvas:ci .
+
+      - name: Start Compose stack
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          APP_BIND_ADDRESS: 127.0.0.1
+          APP_PORT: 3000
+        run: docker compose up --detach
+
+      - name: Wait for health endpoint
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:3000/api/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose ps
+          docker compose logs --tail=200 app postgres
+          exit 1
+
+      - name: Stop Compose stack
+        if: always()
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+        run: docker compose down --volumes
+
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run disposable Docker integration suite
+        run: bash ./scripts/test-integration.sh
