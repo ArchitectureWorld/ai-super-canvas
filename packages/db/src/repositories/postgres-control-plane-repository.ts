@@ -2862,8 +2862,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     runId: string;
     event: PersistableRunEvent;
   }): Promise<StoredRunEvent> {
+    const canonicalEvent = toCanonicalPayload(input.event);
+    const event = JSON.parse(canonicalEvent.text) as PersistableRunEvent;
+    const eventFingerprint = canonicalEvent.hash;
     return this.sql.begin(async (tx) => {
-      const eventFingerprint = toCanonicalPayload(input.event).hash;
       const run = await this.authorizeRun(tx, input.actor, input.runId, {
         lock: true,
         write: true,
@@ -2873,11 +2875,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           external_event_ref, runtime_event_key, event_fingerprint, occurred_at
         FROM run_events
         WHERE run_id = ${input.runId}
-          AND runtime_event_key = ${input.event.runtimeEventKey}
+          AND runtime_event_key = ${event.runtimeEventKey}
       `;
       if (existing) {
         if (existing.event_fingerprint !== eventFingerprint) {
-          throw new RuntimeEventConflictError(input.event.runtimeEventKey);
+          throw new RuntimeEventConflictError(event.runtimeEventKey);
         }
         return {
           runId: existing.run_id,
@@ -2903,17 +2905,17 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           id, run_id, sequence, event_type, payload, external_event_ref,
           runtime_event_key, event_fingerprint, occurred_at
         ) VALUES (
-          ${randomUUID()}, ${input.runId}, ${next.sequence}, ${input.event.eventType},
-          ${tx.json(input.event.payload as postgres.JSONValue)},
-          ${input.event.externalEventRef ?? null}, ${input.event.runtimeEventKey},
-          ${eventFingerprint}, ${input.event.occurredAt}
+          ${randomUUID()}, ${input.runId}, ${next.sequence}, ${event.eventType},
+          ${tx.json(event.payload as postgres.JSONValue)},
+          ${event.externalEventRef ?? null}, ${event.runtimeEventKey},
+          ${eventFingerprint}, ${event.occurredAt}
         )
         RETURNING run_id, sequence::integer AS sequence, event_type, payload,
           external_event_ref, runtime_event_key, event_fingerprint, occurred_at
       `;
       if (!stored) throw new Error('Runtime event was not stored');
 
-      if (input.event.message) {
+      if (event.message) {
         const [lockedSession] = await tx<{ id: string }[]>`
           SELECT id FROM sessions WHERE id = ${run.session_id} FOR UPDATE
         `;
@@ -2931,11 +2933,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
             external_message_ref, source_runtime_event_key
           ) VALUES (
             ${randomUUID()}, ${run.workflow_id}, ${run.session_id}, ${input.runId},
-            ${nextMessage.ordinal}, ${input.event.message.role}, NULL,
+            ${nextMessage.ordinal}, ${event.message.role}, NULL,
             ${run.agent_id},
-            ${tx.json(input.event.message.content as postgres.JSONValue)}, 'completed',
-            ${input.event.message.externalMessageRef ?? null},
-            ${input.event.runtimeEventKey}
+            ${tx.json(event.message.content as postgres.JSONValue)}, 'completed',
+            ${event.message.externalMessageRef ?? null},
+            ${event.runtimeEventKey}
           )
           ON CONFLICT (run_id, source_runtime_event_key)
             WHERE source_runtime_event_key IS NOT NULL
@@ -2943,12 +2945,12 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         `;
       }
 
-      if (input.event.terminal) {
+      if (event.terminal) {
         const [updated] = await tx<{ id: string }[]>`
           UPDATE runs
-          SET status = ${input.event.terminal.status},
-            error_code = ${input.event.terminal.errorCode ?? null},
-            error_message = ${input.event.terminal.errorMessage ?? null},
+          SET status = ${event.terminal.status},
+            error_code = ${event.terminal.errorCode ?? null},
+            error_message = ${event.terminal.errorMessage ?? null},
             completed_at = now()
           WHERE id = ${input.runId}
             AND status IN ('queued', 'running', 'waiting_approval', 'reconciling')

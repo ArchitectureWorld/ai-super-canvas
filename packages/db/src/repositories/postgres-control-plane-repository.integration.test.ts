@@ -1,6 +1,7 @@
 import postgres from 'postgres';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 
+import type { PersistableRunEvent } from './control-plane-run-types';
 import { createPostgresControlPlaneRepository } from './postgres-control-plane-repository';
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -3159,6 +3160,104 @@ describe('PostgresControlPlaneRepository', () => {
       after: 0,
       limit: 101,
     })).rejects.toThrow('Run event limit must be an integer between 1 and 100');
+  });
+
+  it('snapshots a caller-owned Runtime event before waiting for the Run lock', async () => {
+    const { fixture, prepared, session } = await prepareRuntimeRun({
+      suffix: 'event-input-snapshot',
+    });
+    const originalEvent: PersistableRunEvent = {
+      runtimeEventKey: 'snapshot-key',
+      eventType: 'run.completed',
+      payload: { phase: 'original' },
+      occurredAt: '2026-07-18T03:45:01.000Z',
+      message: {
+        role: 'assistant',
+        content: { text: 'original message' },
+      },
+      terminal: { status: 'succeeded' },
+    };
+    const callerEvent = structuredClone(originalEvent);
+    const lockSql = postgres(databaseUrl, { max: 1 });
+    let markLockAcquired!: () => void;
+    let releaseRunLock!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => {
+      markLockAcquired = resolve;
+    });
+    const runLockReleased = new Promise<void>((resolve) => {
+      releaseRunLock = resolve;
+    });
+    const lockTransaction = lockSql.begin(async (tx) => {
+      await tx`SELECT id FROM runs WHERE id = ${prepared.runId} FOR UPDATE`;
+      markLockAcquired();
+      await runLockReleased;
+    });
+    await lockAcquired;
+
+    const ingestion = repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: callerEvent,
+    });
+    try {
+      let waitingForRunLock = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const [waiting] = await sql<{ found: boolean }[]>`
+          SELECT EXISTS (
+            SELECT 1 FROM pg_locks
+            WHERE locktype IN ('tuple', 'transactionid') AND granted = false
+          ) AS found
+        `;
+        waitingForRunLock = waiting?.found ?? false;
+        if (waitingForRunLock) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(waitingForRunLock).toBe(true);
+
+      callerEvent.payload = { phase: 'mutated' };
+      if (!callerEvent.message || !callerEvent.terminal) {
+        throw new Error('Mutable Runtime event fixture is incomplete');
+      }
+      callerEvent.message.content = { text: 'mutated message' };
+      callerEvent.terminal.status = 'failed';
+      callerEvent.terminal.errorCode = 'mutated_after_call';
+      callerEvent.terminal.errorMessage = 'Caller mutated the event while ingestion waited';
+
+      releaseRunLock();
+      await lockTransaction;
+      const stored = await ingestion;
+      expect(stored.payload).toEqual({ phase: 'original' });
+      await expect(repository.loadSessionTranscript({
+        actor: fixture.actor,
+        sessionId: session.sessionId,
+      })).resolves.toMatchObject([
+        { role: 'user' },
+        { role: 'assistant', content: { text: 'original message' } },
+      ]);
+      const [runState] = await sql<{
+        status: string;
+        error_code: string | null;
+        error_message: string | null;
+      }[]>`
+        SELECT status::text AS status, error_code, error_message
+        FROM runs
+        WHERE id = ${prepared.runId}
+      `;
+      expect(runState).toEqual({
+        status: 'succeeded',
+        error_code: null,
+        error_message: null,
+      });
+      await expect(repository.ingestRuntimeEvent({
+        actor: fixture.actor,
+        runId: prepared.runId,
+        event: originalEvent,
+      })).resolves.toEqual(stored);
+    } finally {
+      releaseRunLock();
+      await Promise.allSettled([lockTransaction, ingestion]);
+      await lockSql.end();
+    }
   });
 
   it('deduplicates Runtime event keys, preserves distinct deltas, paginates, and freezes terminal Runs', async () => {
