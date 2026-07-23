@@ -25,7 +25,7 @@
     "test:integration:docker": "bash ./scripts/test-integration.sh"
   },
   "devDependencies": {
-    "@eslint/js": "9.39.5",
+    "@eslint/js": "10.0.1",
     "@playwright/test": "1.61.1",
     "@vitest/coverage-v8": "4.1.10",
     "eslint": "9.39.5",
