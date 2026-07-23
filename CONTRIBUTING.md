@@ -5,7 +5,7 @@ Thank you for helping improve AI Super Canvas. Keep each pull request focused, e
 ## Prerequisites
 
 - Node.js 24.18.0
-- pnpm 11.12.0
+- pnpm 11.15.1
 - Docker Engine with Docker Compose v2
 - Git
 
