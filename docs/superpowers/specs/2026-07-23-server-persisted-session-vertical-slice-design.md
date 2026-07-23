@@ -1,7 +1,7 @@
 # 服务器持久化 Session 纵切设计规格
 
 - 日期：2026-07-23
-- 状态：**Proposed / 等待 PR 审阅**
+- 状态：**Approved / PR #19 已合并**
 - 基线提交：`7ee476a`
 - 目标阶段：S1 控制面闭环，为 S3 真实 Chat SessionNode 提供可运行入口
 - 关联设计：[`2026-07-18-control-plane-test-vertical-slice-design.md`](./2026-07-18-control-plane-test-vertical-slice-design.md)
