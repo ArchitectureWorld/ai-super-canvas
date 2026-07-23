@@ -19,7 +19,10 @@ export interface RunEventPumpPort {
 }
 
 export interface RunEventPumpLogger {
-  error(event: string, context: Record<string, unknown>): void;
+  error(
+    event: string,
+    context: Record<string, unknown>,
+  ): void | Promise<void>;
 }
 
 const defaultLogger: RunEventPumpLogger = {
@@ -49,10 +52,36 @@ function isTerminal(event: RuntimeEvent): boolean {
     || event.type === 'run.cancelled';
 }
 
-function errorMessage(reason: unknown): string {
-  return reason instanceof Error
-    ? reason.message
-    : 'runtime_event_stream_failed';
+type RunEventPumpFailureCode =
+  | 'runtime_run_ref_missing'
+  | 'runtime_event_identity_mismatch'
+  | 'runtime_terminal_history_digest_missing'
+  | 'runtime_event_stream_ended_without_terminal'
+  | 'runtime_event_pump_failed';
+
+class RunEventPumpFailure extends Error {
+  constructor(readonly code: RunEventPumpFailureCode) {
+    super(code);
+    this.name = 'RunEventPumpFailure';
+  }
+}
+
+function failureCode(reason: unknown): RunEventPumpFailureCode {
+  return reason instanceof RunEventPumpFailure
+    ? reason.code
+    : 'runtime_event_pump_failed';
+}
+
+async function logSafely(
+  logger: RunEventPumpLogger,
+  event: string,
+  context: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await logger.error(event, context);
+  } catch {
+    return;
+  }
 }
 
 export class RunEventPump implements RunEventPumpPort {
@@ -69,23 +98,28 @@ export class RunEventPump implements RunEventPumpPort {
     runId: string;
   }): 'started' | 'already-active' {
     if (this.active.has(input.runId)) return 'already-active';
-    const runner = this.consume(input)
+    const runner = Promise.resolve()
+      .then(() => this.consume(input))
       .catch(async (reason: unknown) => {
+        const error = failureCode(reason);
         try {
           await this.repository.markRunReconciling({
             actor: input.actor,
             runId: input.runId,
-            error: errorMessage(reason),
+            error,
           });
-        } catch (reconciliationReason) {
-          this.logger.error('run_event_pump_reconciliation_failed', {
-            runId: input.runId,
-            error: errorMessage(reconciliationReason),
-          });
+        } catch {
+          await logSafely(
+            this.logger,
+            'run_event_pump_reconciliation_failed',
+            { runId: input.runId, error },
+          );
         }
       })
       .finally(() => {
-        this.active.delete(input.runId);
+        if (this.active.get(input.runId) === runner) {
+          this.active.delete(input.runId);
+        }
       });
     this.active.set(input.runId, runner);
     return 'started';
@@ -105,11 +139,10 @@ export class RunEventPump implements RunEventPumpPort {
   }): Promise<void> {
     const context = await this.repository.getRunRuntimeContext(input);
     if (!context.externalRunRef) {
-      throw new Error('runtime_run_ref_missing');
+      throw new RunEventPumpFailure('runtime_run_ref_missing');
     }
     const binding = toRuntimeBinding(context.binding);
     let terminalSeen = false;
-    let lastExternalEventRef: string | undefined;
 
     for await (const event of this.runtime.streamRunEvents({
       binding,
@@ -120,7 +153,7 @@ export class RunEventPump implements RunEventPumpPort {
         event.canvasRunId !== context.runId
         || event.canvasSessionId !== context.sessionId
       ) {
-        throw new Error('runtime_event_identity_mismatch');
+        throw new RunEventPumpFailure('runtime_event_identity_mismatch');
       }
 
       if (isTerminal(event)) {
@@ -131,7 +164,9 @@ export class RunEventPump implements RunEventPumpPort {
           externalSessionRef: context.externalSessionRef,
         });
         if (!runtimeSession.historyDigest) {
-          throw new Error('runtime_terminal_history_digest_missing');
+          throw new RunEventPumpFailure(
+            'runtime_terminal_history_digest_missing',
+          );
         }
         await this.repository.syncRuntimeSessionHistory({
           actor: input.actor,
@@ -145,8 +180,6 @@ export class RunEventPump implements RunEventPumpPort {
         runId: input.runId,
         event: mapRuntimeEvent(event),
       });
-      lastExternalEventRef = event.externalEventRef ?? lastExternalEventRef;
-
       if (isTerminal(event)) {
         terminalSeen = true;
         break;
@@ -154,8 +187,8 @@ export class RunEventPump implements RunEventPumpPort {
     }
 
     if (!terminalSeen) {
-      throw new Error(
-        `runtime_event_stream_ended_without_terminal:${lastExternalEventRef ?? 'none'}`,
+      throw new RunEventPumpFailure(
+        'runtime_event_stream_ended_without_terminal',
       );
     }
   }

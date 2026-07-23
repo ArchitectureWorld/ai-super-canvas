@@ -128,7 +128,7 @@ describe('RunEventPump', () => {
     expect(harness.repository.markRunReconciling).toHaveBeenCalledWith({
       actor,
       runId: context.runId,
-      error: 'runtime_event_stream_ended_without_terminal:none',
+      error: 'runtime_event_stream_ended_without_terminal',
     });
   });
 
@@ -168,5 +168,162 @@ describe('RunEventPump', () => {
     } finally {
       process.off('unhandledRejection', unhandled);
     }
+  });
+
+  it('claims a Run before repository loading can synchronously reenter start', async () => {
+    const harness = createHarness(terminalEvents());
+    let reentrantStart: 'started' | 'already-active' | undefined;
+    harness.repository.getRunRuntimeContext.mockImplementationOnce(() => {
+      reentrantStart = harness.pump.start({ actor, runId: context.runId });
+      return Promise.resolve(context);
+    });
+
+    expect(harness.pump.start({ actor, runId: context.runId })).toBe('started');
+    await Promise.resolve();
+
+    expect(reentrantStart).toBe('already-active');
+    await harness.pump.waitForIdle(context.runId);
+    expect(harness.runtime.streamRunEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the active claim while a reentrant runner finishes out of order', async () => {
+    const terminal = terminalEvents().at(-1)!;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const heldStream = (): AsyncIterable<RuntimeEvent> => (async function* () {
+      await gate;
+      yield terminal;
+    })();
+    const harness = createHarness([]);
+    harness.runtime.streamRunEvents
+      .mockImplementationOnce(() => heldStream())
+      .mockImplementation(() => stream([terminal]));
+    harness.repository.getRunRuntimeContext.mockImplementationOnce(() => {
+      harness.pump.start({ actor, runId: context.runId });
+      return Promise.resolve(context);
+    });
+
+    expect(harness.pump.start({ actor, runId: context.runId })).toBe('started');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    try {
+      expect(harness.pump.start({ actor, runId: context.runId }))
+        .toBe('already-active');
+      expect(harness.runtime.streamRunEvents).toHaveBeenCalledTimes(1);
+    } finally {
+      release();
+    }
+    await harness.pump.waitForIdle(context.runId);
+  });
+
+  it('uses a safe failure category for unknown Runtime events', async () => {
+    const secretSentinel = 'secretRef:SENTINEL-SECRET';
+    const runtimeKeySentinel = 'runtimeEventKey:SENTINEL-RUNTIME-KEY';
+    const externalRefSentinel = 'externalRef:SENTINEL-EXTERNAL';
+    const [event] = terminalEvents();
+    const harness = createHarness([
+      {
+        ...event!,
+        eventId: runtimeKeySentinel,
+        externalEventRef: externalRefSentinel,
+        type: 'runtime.unknown',
+        secretRef: secretSentinel,
+      } as unknown as RuntimeEvent,
+    ]);
+
+    harness.pump.start({ actor, runId: context.runId });
+    await harness.pump.waitForIdle(context.runId);
+
+    expect(harness.repository.markRunReconciling).toHaveBeenCalledWith({
+      actor,
+      runId: context.runId,
+      error: 'runtime_event_pump_failed',
+    });
+    const persisted = JSON.stringify(
+      harness.repository.markRunReconciling.mock.calls,
+    );
+    expect(persisted).not.toContain(secretSentinel);
+    expect(persisted).not.toContain(runtimeKeySentinel);
+    expect(persisted).not.toContain(externalRefSentinel);
+  });
+
+  it('does not leak repository or reconciliation errors into logs', async () => {
+    const secretSentinel = 'secretRef:SENTINEL-SECRET';
+    const runtimeKeySentinel = 'runtimeEventKey:SENTINEL-RUNTIME-KEY';
+    const externalRefSentinel = 'externalRef:SENTINEL-EXTERNAL';
+    const [event] = terminalEvents();
+    const harness = createHarness([event!]);
+    harness.repository.ingestRuntimeEvent.mockRejectedValueOnce(
+      new Error(
+        `conflict ${runtimeKeySentinel} ${externalRefSentinel} ${secretSentinel}`,
+      ),
+    );
+    harness.repository.markRunReconciling.mockRejectedValueOnce(
+      new Error(
+        `database ${runtimeKeySentinel} ${externalRefSentinel} ${secretSentinel}`,
+      ),
+    );
+
+    harness.pump.start({ actor, runId: context.runId });
+    await harness.pump.waitForIdle(context.runId);
+
+    expect(harness.repository.markRunReconciling).toHaveBeenCalledWith({
+      actor,
+      runId: context.runId,
+      error: 'runtime_event_pump_failed',
+    });
+    expect(harness.logger.error).toHaveBeenCalledWith(
+      'run_event_pump_reconciliation_failed',
+      {
+        runId: context.runId,
+        error: 'runtime_event_pump_failed',
+      },
+    );
+    const observableFailures = JSON.stringify({
+      persisted: harness.repository.markRunReconciling.mock.calls,
+      logged: harness.logger.error.mock.calls,
+    });
+    expect(observableFailures).not.toContain(secretSentinel);
+    expect(observableFailures).not.toContain(runtimeKeySentinel);
+    expect(observableFailures).not.toContain(externalRefSentinel);
+  });
+
+  it('absorbs a synchronous logger failure and releases the active claim', async () => {
+    const harness = createHarness([]);
+    harness.repository.markRunReconciling.mockRejectedValueOnce(
+      new Error('database unavailable'),
+    );
+    harness.logger.error.mockImplementationOnce(() => {
+      throw new Error('logger unavailable');
+    });
+
+    expect(harness.pump.start({ actor, runId: context.runId })).toBe('started');
+    await expect(harness.pump.waitForIdle(context.runId)).resolves.toBeUndefined();
+
+    expect(harness.pump.start({ actor, runId: context.runId })).toBe('started');
+    await harness.pump.waitForIdle(context.runId);
+  });
+
+  it('observes and absorbs an asynchronous logger failure', async () => {
+    const harness = createHarness([]);
+    harness.repository.markRunReconciling.mockRejectedValueOnce(
+      new Error('database unavailable'),
+    );
+    let loggerFailureObserved = false;
+    const loggerFailure = {
+      then(_resolve: unknown, reject: (reason: unknown) => void) {
+        loggerFailureObserved = true;
+        reject(new Error('logger unavailable'));
+      },
+    } as unknown as Promise<void>;
+    harness.logger.error.mockReturnValueOnce(loggerFailure);
+
+    harness.pump.start({ actor, runId: context.runId });
+    await expect(
+      harness.pump.waitForIdle(context.runId),
+    ).resolves.toBeUndefined();
+    expect(loggerFailureObserved).toBe(true);
   });
 });
