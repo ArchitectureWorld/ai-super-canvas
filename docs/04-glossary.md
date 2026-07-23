@@ -1,12 +1,44 @@
 # 术语表
 
-> 文档状态：产品语言参考。涉及 Account、Agent、Workflow、Session、Run、Artifact、Proposal，以及 Branch/落叶精确生命周期时，以 [`agent-session-domain-model.md`](./architecture/agent-session-domain-model.md) 为准。
+> 文档状态：产品语言参考。涉及 Account、Agent、Workflow、Session、Run、Artifact、Proposal，以及 Branch/落叶精确生命周期时，以 [`agent-session-domain-model.md`](./architecture/agent-session-domain-model.md) 为准。顶层世界画布与跨项目关系的产品定义见 [`docs/09-world-canvas.md`](./09-world-canvas.md)。
 
 ## AI 超级画板
 
 面向 AI 原生工作流的图谱式 / 有机式智能画布。
 
 它不是传统绘图软件，也不是普通线性 Chat，而是用于承载对话、素材、文件、任务、结论和 Agent 协作的生长型空间。
+
+## 世界画布
+
+World Canvas。
+
+AI 超级画板的最高产品尺度。它以图谱方式呈现用户有权访问的领域、项目门户、能力、基础设施、成果及其关系，并通过语义缩放进入项目内部 Workflow/Session 画布。
+
+世界画布是顶层投影，不是第二套工作台，也不是对 `Workspace` 的重新定义。
+
+## 项目门户
+
+Project Portal。
+
+世界画布中代表某个项目的入口和摘要节点。它引用内部 Workflow 或显式登记的外部项目描述，显示目标、状态、最近活动、里程碑和主要成果。
+
+项目门户不复制项目事实源。当前它是产品投影对象；如果未来需要正式 `Project` 聚合，必须通过独立 ADR 引入。
+
+## 语义缩放
+
+Semantic Zoom。
+
+缩放或聚焦时，根据当前信息尺度切换对象的语义投影，而不只是机械改变图形大小。
+
+例如：远景显示领域和核心项目，中景显示项目关系，近景显示项目门户摘要，显式进入后才加载 Workflow、Session、Message 和 Run 细节。
+
+## 世界关系
+
+World Relation。
+
+世界画布中跨项目、跨能力或跨基础设施的有类型关系，例如 `depends_on`、`uses`、`produces`、`evolves_from` 和 `deployed_on`。
+
+世界关系不同于 `SessionEdge`：`SessionEdge` 只描述同一 Workflow 中 SessionNode 的关系，世界关系不能用于表达 Session 亲缘、上下文继承或工具授权。
 
 ## 图谱式会话
 
