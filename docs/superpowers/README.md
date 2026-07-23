@@ -24,6 +24,27 @@ architecture/ADR + domain + runtime contract
 
 Earlier Feature 01 documents remain useful for product semantics and prototype history, but cannot override the current Agent-Session architecture.
 
+## Future Product Design: World Canvas
+
+Product baseline:
+
+- `../09-world-canvas.md`
+
+Design specification awaiting user review:
+
+- `specs/2026-07-23-world-canvas-and-multiscale-subgraphs-design.md`
+
+The World Canvas design defines the top-level project graph, project portals, semantic zoom, typed cross-project relationships, permission boundaries, and AI relation proposals. It does not yet authorize implementation or change the current S1–S4 dependency order.
+
+Authority for World Canvas work:
+
+```text
+architecture/ADR + Agent-Session domain invariants
+> docs/09-world-canvas.md product baseline
+> 2026-07-23 World Canvas design specification
+> future implementation plan after user approval
+```
+
 ## Historical Feature 01: Organic Graph Workspace
 
 ### Historical Design Record
