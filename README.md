@@ -12,6 +12,8 @@ The first product slice is **Feature 01: graph-based / organic conversation canv
 
 The longer-term foundation includes AI image workflows, structured asset generation, presentation workflows, CAD agents, multi-agent orchestration, and durable project memory. Focus modes change emphasis inside the same canvas; they do not create separate workspaces.
 
+At the highest product scale, AI Super Canvas becomes a **World Canvas**: a semantic-zoom graph of domains, project portals, capabilities, infrastructure, deliverables, and their typed relationships. It provides a continuous path from “everything I am building” into a specific project, Workflow, Session, and semantic object without copying each project’s source of truth.
+
 ## Architecture
 
 Each canvas Chat block is designed to become a persistent `SessionNode/Session`. A Workflow contains branchable Sessions, each execution is a distinct Run, and the control plane uses replaceable Runtime adapters.
@@ -23,6 +25,8 @@ Each canvas Chat block is designed to become a persistent `SessionNode/Session`.
 - [Runtime adapter contract](docs/architecture/runtime-adapter-contract.md)
 - [Hermes ACP capability gates](docs/architecture/hermes-acp-capability-gates.md)
 - [Development roadmap](docs/architecture/development-roadmap.md)
+- [World Canvas product baseline](docs/09-world-canvas.md)
+- [World Canvas and multi-scale subgraph design](docs/superpowers/specs/2026-07-23-world-canvas-and-multiscale-subgraphs-design.md)
 - [Deep repository review dated 2026-07-22](docs/reviews/2026-07-22-deep-repository-review.md)
 
 ## Prerequisites
@@ -90,5 +94,8 @@ For security reports, do not open a public issue. Follow [SECURITY.md](SECURITY.
 - Graph-based Conversation / 图谱式会话
 - Organic Conversation / 有机式会话
 - Unified Workspace / 统一工作台
+- World Canvas / 世界画布
+- Semantic Zoom / 语义缩放
+- Project Graph / 项目图谱
 - Semantic Anchor / 语义锚点
 - Branching, reintegration, pruning, decay, and trunk reconstruction
