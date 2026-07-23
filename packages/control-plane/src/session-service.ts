@@ -107,13 +107,14 @@ class RuntimeNotAppliedFailure extends Error {
   }
 }
 
-async function persistSafely(
+async function confirmPersistence(
   operation: () => Promise<void>,
-): Promise<void> {
+): Promise<boolean> {
   try {
     await operation();
+    return true;
   } catch {
-    return;
+    return false;
   }
 }
 
@@ -199,6 +200,24 @@ export class SessionService {
       actor: input.actor,
       commandReceiptId: prepared.commandReceiptId,
     });
+    if (
+      !dispatch.dispatchAllowed
+      && dispatch.phase === 'runtime_dispatched'
+    ) {
+      await confirmPersistence(
+        () => this.repository.markRuntimeCommandReconciling({
+          actor: input.actor,
+          commandReceiptId: prepared.commandReceiptId,
+          externalResourceKind: 'session',
+          lookupMetadata: {
+            commandId: input.commandId,
+            canvasSessionId: prepared.sessionId,
+          },
+          error: 'runtime_dispatch_persistence_unconfirmed',
+        }),
+      );
+      throw commandRequiresReconciliation(prepared.commandReceiptId);
+    }
     if (!dispatch.dispatchAllowed) {
       return nonDispatchable(
         prepared.commandReceiptId,
@@ -271,34 +290,55 @@ export class SessionService {
       return attachedSession(prepared.sessionId, prepared.nodeId);
     } catch (reason) {
       if (reason instanceof RuntimeNotAppliedFailure) {
-        await persistSafely(() => this.repository.markRuntimeCommandFailure({
-          actor: input.actor,
-          commandReceiptId: prepared.commandReceiptId,
-          retryable: reason.adapterError.retryable,
-          error: runtimeFailureCategory(
-            reason.adapterError,
-            failureCategory,
-          ),
-        }));
-        throw runtimeOperationFailed(
-          prepared.commandReceiptId,
-          reason.adapterError.retryable,
+        const error = runtimeFailureCategory(
+          reason.adapterError,
+          failureCategory,
         );
+        const failureConfirmed = await confirmPersistence(
+          () => this.repository.markRuntimeCommandFailure({
+            actor: input.actor,
+            commandReceiptId: prepared.commandReceiptId,
+            retryable: reason.adapterError.retryable,
+            error,
+          }),
+        );
+        if (failureConfirmed) {
+          throw runtimeOperationFailed(
+            prepared.commandReceiptId,
+            reason.adapterError.retryable,
+          );
+        }
+
+        await confirmPersistence(
+          () => this.repository.markRuntimeCommandReconciling({
+            actor: input.actor,
+            commandReceiptId: prepared.commandReceiptId,
+            externalResourceKind: 'session',
+            lookupMetadata: {
+              commandId: input.commandId,
+              canvasSessionId: prepared.sessionId,
+            },
+            error,
+          }),
+        );
+        throw commandRequiresReconciliation(prepared.commandReceiptId);
       }
 
-      await persistSafely(() => this.repository.markRuntimeCommandReconciling({
-        actor: input.actor,
-        commandReceiptId: prepared.commandReceiptId,
-        externalResourceKind: 'session',
-        ...(knownExternalSessionRef === undefined
-          ? {}
-          : { externalResourceRef: knownExternalSessionRef }),
-        lookupMetadata: {
-          commandId: input.commandId,
-          canvasSessionId: prepared.sessionId,
-        },
-        error: runtimeFailureCategory(reason, failureCategory),
-      }));
+      await confirmPersistence(
+        () => this.repository.markRuntimeCommandReconciling({
+          actor: input.actor,
+          commandReceiptId: prepared.commandReceiptId,
+          externalResourceKind: 'session',
+          ...(knownExternalSessionRef === undefined
+            ? {}
+            : { externalResourceRef: knownExternalSessionRef }),
+          lookupMetadata: {
+            commandId: input.commandId,
+            canvasSessionId: prepared.sessionId,
+          },
+          error: runtimeFailureCategory(reason, failureCategory),
+        }),
+      );
       throw commandRequiresReconciliation(prepared.commandReceiptId);
     }
   }

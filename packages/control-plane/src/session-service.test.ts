@@ -508,4 +508,151 @@ describe('SessionService Session creation', () => {
       }),
     );
   });
+
+  it('retries reconciliation persistence on a runtime-dispatched replay without redispatch', async () => {
+    const repository = createSessionRepository();
+    repository.beginRuntimeDispatch
+      .mockResolvedValueOnce({
+        phase: 'runtime_dispatched',
+        dispatchAllowed: true,
+      })
+      .mockResolvedValueOnce({
+        phase: 'runtime_dispatched',
+        dispatchAllowed: false,
+      });
+    const runtimeSentinel = 'externalSessionRef:SENTINEL-RUNTIME';
+    const persistenceSentinel = 'secretRef:SENTINEL-PERSISTENCE';
+    repository.markRuntimeCommandReconciling
+      .mockRejectedValueOnce(
+        new Error(`reconciliation failed ${persistenceSentinel}`),
+      )
+      .mockResolvedValueOnce(undefined);
+    const runtime = {
+      createSession: vi.fn().mockRejectedValue(
+        new Error(`runtime response lost ${runtimeSentinel}`),
+      ),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+    const request = {
+      actor,
+      commandId: ids.commandId,
+      workflowId: ids.workflowId,
+      agentBindingId: ids.bindingId,
+      title: 'Main Session',
+    };
+
+    const failures: unknown[] = [];
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await service.createRootSession(request);
+      } catch (reason) {
+        failures.push(reason);
+      }
+    }
+
+    expect(failures).toHaveLength(2);
+    for (const failure of failures) {
+      expect(failure).toMatchObject({
+        code: 'command_requires_reconciliation',
+        message: 'Runtime command requires reconciliation',
+        commandReceiptId: ids.receiptId,
+        cause: undefined,
+      } satisfies Partial<ControlPlaneApplicationError>);
+      expect(String(failure)).not.toContain(runtimeSentinel);
+      expect(String(failure)).not.toContain(persistenceSentinel);
+    }
+    expect(runtime.createSession).toHaveBeenCalledOnce();
+    expect(repository.getSessionRuntimeContext).toHaveBeenCalledOnce();
+    expect(repository.beginRuntimeDispatch).toHaveBeenCalledTimes(2);
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledTimes(2);
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenNthCalledWith(
+      2,
+      {
+        actor,
+        commandReceiptId: ids.receiptId,
+        externalResourceKind: 'session',
+        lookupMetadata: {
+          commandId: ids.commandId,
+          canvasSessionId: ids.sessionId,
+        },
+        error: 'runtime_dispatch_persistence_unconfirmed',
+      },
+    );
+    expect(JSON.stringify(
+      repository.markRuntimeCommandReconciling.mock.calls,
+    )).not.toContain(runtimeSentinel);
+    expect(JSON.stringify(
+      repository.markRuntimeCommandReconciling.mock.calls,
+    )).not.toContain(persistenceSentinel);
+  });
+
+  it('downgrades an unconfirmed not-applied failure to reconciliation', async () => {
+    const repository = createSessionRepository();
+    const runtimeSentinel = 'externalSessionRef:SENTINEL-NOT-APPLIED';
+    const persistenceSentinel = 'secretRef:SENTINEL-FAILURE-PERSISTENCE';
+    repository.markRuntimeCommandFailure.mockRejectedValueOnce(
+      new Error(`failure persistence lost ${persistenceSentinel}`),
+    );
+    const runtime = {
+      createSession: vi.fn().mockRejectedValue(
+        new RuntimeAdapterError(
+          'runtime_unavailable',
+          `runtime offline ${runtimeSentinel}`,
+          true,
+          'not-applied',
+        ),
+      ),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+
+    let caught: unknown;
+    try {
+      await service.createRootSession({
+        actor,
+        commandId: ids.commandId,
+        workflowId: ids.workflowId,
+        agentBindingId: ids.bindingId,
+        title: 'Main Session',
+      });
+    } catch (reason) {
+      caught = reason;
+    }
+
+    expect(caught).toMatchObject({
+      code: 'command_requires_reconciliation',
+      message: 'Runtime command requires reconciliation',
+      commandReceiptId: ids.receiptId,
+      cause: undefined,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(String(caught)).not.toContain(runtimeSentinel);
+    expect(String(caught)).not.toContain(persistenceSentinel);
+    expect(runtime.createSession).toHaveBeenCalledOnce();
+    expect(repository.markRuntimeCommandFailure).toHaveBeenCalledOnce();
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledWith({
+      actor,
+      commandReceiptId: ids.receiptId,
+      externalResourceKind: 'session',
+      lookupMetadata: {
+        commandId: ids.commandId,
+        canvasSessionId: ids.sessionId,
+      },
+      error: 'runtime_adapter:runtime_unavailable:not-applied',
+    });
+    expect(JSON.stringify({
+      failure: repository.markRuntimeCommandFailure.mock.calls,
+      reconciliation: repository.markRuntimeCommandReconciling.mock.calls,
+    })).not.toContain(runtimeSentinel);
+    expect(JSON.stringify({
+      failure: repository.markRuntimeCommandFailure.mock.calls,
+      reconciliation: repository.markRuntimeCommandReconciling.mock.calls,
+    })).not.toContain(persistenceSentinel);
+  });
 });
