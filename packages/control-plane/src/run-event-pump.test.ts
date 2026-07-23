@@ -186,36 +186,59 @@ describe('RunEventPump', () => {
     expect(harness.runtime.streamRunEvents).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps the active claim while a reentrant runner finishes out of order', async () => {
+  it('does not let a completed runner delete a replacement owner', async () => {
     const terminal = terminalEvents().at(-1)!;
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
+    let markStreamEntered!: () => void;
+    const streamEntered = new Promise<void>((resolve) => {
+      markStreamEntered = resolve;
+    });
+    let releaseOldRunner!: () => void;
+    const oldRunnerGate = new Promise<void>((resolve) => {
+      releaseOldRunner = resolve;
     });
     const heldStream = (): AsyncIterable<RuntimeEvent> => (async function* () {
-      await gate;
+      markStreamEntered();
+      await oldRunnerGate;
       yield terminal;
     })();
     const harness = createHarness([]);
     harness.runtime.streamRunEvents
       .mockImplementationOnce(() => heldStream())
       .mockImplementation(() => stream([terminal]));
-    harness.repository.getRunRuntimeContext.mockImplementationOnce(() => {
-      harness.pump.start({ actor, runId: context.runId });
-      return Promise.resolve(context);
-    });
+    const active = (
+      harness.pump as unknown as {
+        active: Map<string, Promise<void>>;
+      }
+    ).active;
 
     expect(harness.pump.start({ actor, runId: context.runId })).toBe('started');
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    const oldOwner = active.get(context.runId)!;
+    expect(oldOwner).toBeDefined();
+    await streamEntered;
+    expect(active.get(context.runId)).toBe(oldOwner);
+
+    let releaseReplacement!: () => void;
+    const replacementOwner = new Promise<void>((resolve) => {
+      releaseReplacement = resolve;
+    });
+    active.set(context.runId, replacementOwner);
 
     try {
+      releaseOldRunner();
+      await oldOwner;
+
+      expect(active.get(context.runId)).toBe(replacementOwner);
       expect(harness.pump.start({ actor, runId: context.runId }))
         .toBe('already-active');
       expect(harness.runtime.streamRunEvents).toHaveBeenCalledTimes(1);
     } finally {
-      release();
+      releaseOldRunner();
+      releaseReplacement();
+      await Promise.all([oldOwner, replacementOwner]);
+      if (active.get(context.runId) === replacementOwner) {
+        active.delete(context.runId);
+      }
     }
-    await harness.pump.waitForIdle(context.runId);
   });
 
   it('uses a safe failure category for unknown Runtime events', async () => {
