@@ -10,3 +10,4 @@ allowBuilds:
 overrides:
   sharp: "0.35.3"
   postcss: "8.5.21"
+  esbuild: "0.28.1"
