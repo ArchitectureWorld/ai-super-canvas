@@ -388,4 +388,124 @@ describe('SessionService Session creation', () => {
       }),
     );
   });
+
+  it('returns the attached Session when a competing dispatch wins the lease race', async () => {
+    const repository = createSessionRepository();
+    repository.beginRuntimeDispatch.mockResolvedValueOnce({
+      phase: 'attached',
+      dispatchAllowed: false,
+    });
+    const runtime = new DeterministicFakeRuntime();
+    const createSpy = vi.spyOn(runtime, 'createSession');
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime,
+      pump,
+    );
+
+    await expect(service.createRootSession({
+      actor,
+      commandId: ids.commandId,
+      workflowId: ids.workflowId,
+      agentBindingId: ids.bindingId,
+      title: 'Main Session',
+    })).resolves.toEqual({
+      sessionId: ids.sessionId,
+      nodeId: ids.nodeId,
+      status: 'active',
+    });
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(repository.getSessionRuntimeContext).not.toHaveBeenCalled();
+    expect(repository.markRuntimeCommandReconciling).not.toHaveBeenCalled();
+  });
+
+  it('reconciles a context-load failure after the dispatch lease without leaking it', async () => {
+    const repository = createSessionRepository();
+    const secretSentinel = 'secretRef:SENTINEL-CONTEXT-LOAD';
+    repository.getSessionRuntimeContext.mockRejectedValueOnce(
+      new Error(`context database failed ${secretSentinel}`),
+    );
+    const runtime = new DeterministicFakeRuntime();
+    const createSpy = vi.spyOn(runtime, 'createSession');
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime,
+      pump,
+    );
+
+    const failure = service.createRootSession({
+      actor,
+      commandId: ids.commandId,
+      workflowId: ids.workflowId,
+      agentBindingId: ids.bindingId,
+      title: 'Main Session',
+    });
+    await expect(failure).rejects.toMatchObject({
+      code: 'command_requires_reconciliation',
+      message: 'Runtime command requires reconciliation',
+      commandReceiptId: ids.receiptId,
+      cause: undefined,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledWith({
+      actor,
+      commandReceiptId: ids.receiptId,
+      externalResourceKind: 'session',
+      lookupMetadata: {
+        commandId: ids.commandId,
+        canvasSessionId: ids.sessionId,
+      },
+      error: 'runtime_session_context_load_failed',
+    });
+    expect(JSON.stringify(
+      repository.markRuntimeCommandReconciling.mock.calls,
+    )).not.toContain(secretSentinel);
+  });
+
+  it('returns a safe error when reconciliation persistence also fails', async () => {
+    const repository = createSessionRepository();
+    const contextSentinel = 'externalSessionRef:SENTINEL-CONTEXT';
+    const persistenceSentinel = 'secretRef:SENTINEL-RECONCILIATION';
+    repository.getSessionRuntimeContext.mockRejectedValueOnce(
+      new Error(`context database failed ${contextSentinel}`),
+    );
+    repository.markRuntimeCommandReconciling.mockRejectedValueOnce(
+      new Error(`reconciliation failed ${persistenceSentinel}`),
+    );
+    const runtime = new DeterministicFakeRuntime();
+    const createSpy = vi.spyOn(runtime, 'createSession');
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime,
+      pump,
+    );
+
+    let caught: unknown;
+    try {
+      await service.createRootSession({
+        actor,
+        commandId: ids.commandId,
+        workflowId: ids.workflowId,
+        agentBindingId: ids.bindingId,
+        title: 'Main Session',
+      });
+    } catch (reason) {
+      caught = reason;
+    }
+
+    expect(caught).toMatchObject({
+      code: 'command_requires_reconciliation',
+      message: 'Runtime command requires reconciliation',
+      commandReceiptId: ids.receiptId,
+      cause: undefined,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(String(caught)).not.toContain(contextSentinel);
+    expect(String(caught)).not.toContain(persistenceSentinel);
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: 'runtime_session_context_load_failed',
+      }),
+    );
+  });
 });

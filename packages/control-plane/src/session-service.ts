@@ -100,14 +100,50 @@ function attachedSession(
   return { sessionId, nodeId, status: 'active' };
 }
 
+class RuntimeNotAppliedFailure extends Error {
+  constructor(readonly adapterError: RuntimeAdapterError) {
+    super('runtime_not_applied');
+    this.name = 'RuntimeNotAppliedFailure';
+  }
+}
+
+async function persistSafely(
+  operation: () => Promise<void>,
+): Promise<void> {
+  try {
+    await operation();
+  } catch {
+    return;
+  }
+}
+
+function assertNever(
+  _phase: never,
+  commandReceiptId: string,
+): never {
+  throw commandRequiresReconciliation(commandReceiptId);
+}
+
 function nonDispatchable(
   commandReceiptId: string,
   phase: OrchestrationPhase,
-): never {
-  if (phase === 'terminal_failure') {
-    throw runtimeOperationFailed(commandReceiptId, false);
+  sessionId: string,
+  nodeId: string,
+): CreatedSessionDto {
+  switch (phase) {
+    case 'attached':
+      return attachedSession(sessionId, nodeId);
+    case 'terminal_failure':
+      throw runtimeOperationFailed(commandReceiptId, false);
+    case 'canvas_prepared':
+    case 'runtime_dispatched':
+    case 'runtime_known':
+    case 'reconciling':
+    case 'retryable_failure':
+      throw commandRequiresReconciliation(commandReceiptId);
+    default:
+      return assertNever(phase, commandReceiptId);
   }
-  throw commandRequiresReconciliation(commandReceiptId);
 }
 
 export class SessionService {
@@ -151,7 +187,12 @@ export class SessionService {
       return attachedSession(prepared.sessionId, prepared.nodeId);
     }
     if (prepared.phase === 'terminal_failure') {
-      return nonDispatchable(prepared.commandReceiptId, prepared.phase);
+      return nonDispatchable(
+        prepared.commandReceiptId,
+        prepared.phase,
+        prepared.sessionId,
+        prepared.nodeId,
+      );
     }
 
     const dispatch = await this.repository.beginRuntimeDispatch({
@@ -159,17 +200,24 @@ export class SessionService {
       commandReceiptId: prepared.commandReceiptId,
     });
     if (!dispatch.dispatchAllowed) {
-      return nonDispatchable(prepared.commandReceiptId, dispatch.phase);
+      return nonDispatchable(
+        prepared.commandReceiptId,
+        dispatch.phase,
+        prepared.sessionId,
+        prepared.nodeId,
+      );
     }
 
-    const context = await this.repository.getSessionRuntimeContext({
-      actor: input.actor,
-      sessionId: prepared.sessionId,
-    });
-
-    let runtimeSession: Awaited<ReturnType<RuntimeAdapter['createSession']>>;
+    let failureCategory = 'runtime_session_context_load_failed';
+    let knownExternalSessionRef: string | undefined;
     try {
-      runtimeSession = await this.runtime.createSession({
+      const context = await this.repository.getSessionRuntimeContext({
+        actor: input.actor,
+        sessionId: prepared.sessionId,
+      });
+
+      failureCategory = 'runtime_session_input_build_failed';
+      const runtimeInput: Parameters<RuntimeAdapter['createSession']>[0] = {
         commandId: input.commandId,
         binding: toSessionBinding(context.binding),
         canvasSessionId: prepared.sessionId,
@@ -179,85 +227,79 @@ export class SessionService {
         },
         toolPolicy: toRuntimeToolPolicy(context.config.toolPolicy),
         context: toRuntimeContext(context.context),
-      });
-    } catch (reason) {
-      const error = runtimeFailureCategory(
-        reason,
-        'runtime_session_create_failed',
-      );
-      if (
-        reason instanceof RuntimeAdapterError
-        && reason.operationEffect === 'not-applied'
-      ) {
-        await this.repository.markRuntimeCommandFailure({
-          actor: input.actor,
-          commandReceiptId: prepared.commandReceiptId,
-          retryable: reason.retryable,
-          error,
-        });
-        throw runtimeOperationFailed(
-          prepared.commandReceiptId,
-          reason.retryable,
-        );
+      };
+
+      failureCategory = 'runtime_session_create_failed';
+      let runtimeSession: Awaited<
+        ReturnType<RuntimeAdapter['createSession']>
+      >;
+      try {
+        runtimeSession = await this.runtime.createSession(runtimeInput);
+      } catch (reason) {
+        if (
+          reason instanceof RuntimeAdapterError
+          && reason.operationEffect === 'not-applied'
+        ) {
+          throw new RuntimeNotAppliedFailure(reason);
+        }
+        throw reason;
       }
-      await this.repository.markRuntimeCommandReconciling({
-        actor: input.actor,
-        commandReceiptId: prepared.commandReceiptId,
-        externalResourceKind: 'session',
-        lookupMetadata: {
-          commandId: input.commandId,
-          canvasSessionId: prepared.sessionId,
-        },
-        error,
-      });
-      throw commandRequiresReconciliation(prepared.commandReceiptId);
-    }
 
-    const externalSessionRef = runtimeSession.externalSessionRef;
-    if (!externalSessionRef?.trim() || !runtimeSession.historyDigest) {
-      await this.repository.markRuntimeCommandReconciling({
-        actor: input.actor,
-        commandReceiptId: prepared.commandReceiptId,
-        externalResourceKind: 'session',
-        ...(externalSessionRef?.trim()
-          ? { externalResourceRef: externalSessionRef }
-          : {}),
-        lookupMetadata: {
-          commandId: input.commandId,
-          canvasSessionId: prepared.sessionId,
-        },
-        error: 'runtime_session_ref_or_history_digest_missing',
-      });
-      throw commandRequiresReconciliation(prepared.commandReceiptId);
-    }
+      failureCategory = 'runtime_session_ref_or_history_digest_missing';
+      const externalSessionRef = runtimeSession.externalSessionRef;
+      knownExternalSessionRef = externalSessionRef?.trim()
+        ? externalSessionRef
+        : undefined;
+      if (!knownExternalSessionRef || !runtimeSession.historyDigest) {
+        throw new Error(failureCategory);
+      }
 
-    try {
+      failureCategory = 'runtime_session_record_failed';
       await this.repository.recordRuntimeResourceKnown({
         actor: input.actor,
         commandReceiptId: prepared.commandReceiptId,
         externalResourceKind: 'session',
-        externalResourceRef: externalSessionRef,
+        externalResourceRef: knownExternalSessionRef,
       });
+      failureCategory = 'runtime_session_attach_failed';
       await this.repository.attachRuntimeSession({
         actor: input.actor,
         commandReceiptId: prepared.commandReceiptId,
         runtimeSession,
       });
-    } catch {
-      await this.repository.markRuntimeCommandReconciling({
+
+      return attachedSession(prepared.sessionId, prepared.nodeId);
+    } catch (reason) {
+      if (reason instanceof RuntimeNotAppliedFailure) {
+        await persistSafely(() => this.repository.markRuntimeCommandFailure({
+          actor: input.actor,
+          commandReceiptId: prepared.commandReceiptId,
+          retryable: reason.adapterError.retryable,
+          error: runtimeFailureCategory(
+            reason.adapterError,
+            failureCategory,
+          ),
+        }));
+        throw runtimeOperationFailed(
+          prepared.commandReceiptId,
+          reason.adapterError.retryable,
+        );
+      }
+
+      await persistSafely(() => this.repository.markRuntimeCommandReconciling({
         actor: input.actor,
         commandReceiptId: prepared.commandReceiptId,
         externalResourceKind: 'session',
-        externalResourceRef: externalSessionRef,
+        ...(knownExternalSessionRef === undefined
+          ? {}
+          : { externalResourceRef: knownExternalSessionRef }),
         lookupMetadata: {
           commandId: input.commandId,
           canvasSessionId: prepared.sessionId,
         },
-        error: 'runtime_session_attach_failed',
-      });
+        error: runtimeFailureCategory(reason, failureCategory),
+      }));
       throw commandRequiresReconciliation(prepared.commandReceiptId);
     }
-
-    return attachedSession(prepared.sessionId, prepared.nodeId);
   }
 }
