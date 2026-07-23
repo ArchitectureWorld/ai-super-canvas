@@ -28,7 +28,7 @@ Each canvas Chat block is designed to become a persistent `SessionNode/Session`.
 ## Prerequisites
 
 - Node.js 24.18.0
-- pnpm 11.12.0
+- pnpm 11.15.1
 - Docker Engine with Docker Compose v2
 - Git
 

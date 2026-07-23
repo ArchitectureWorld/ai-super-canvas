@@ -4,7 +4,7 @@ ENV PNPM_HOME=/pnpm
 ENV PATH=${PNPM_HOME}:${PATH}
 ENV NEXT_TELEMETRY_DISABLED=1
 
-RUN npm install --global pnpm@11.12.0
+RUN npm install --global pnpm@11.15.1
 WORKDIR /workspace
 
 FROM base AS dependencies
