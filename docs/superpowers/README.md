@@ -14,6 +14,12 @@ Current implementation entry:
 
 - `plans/2026-07-15-agent-session-control-plane-foundation.md`
 
+Next server-persisted Session slice awaiting PR review:
+
+- `specs/2026-07-23-server-persisted-session-vertical-slice-design.md`
+
+This specification re-baselines the remaining application-service, API, test-page, and Golden Path work against the current repository. After approval, a new implementation plan will replace the obsolete unchecked portions of the older control-plane test plan without redoing completed domain, Runtime, or PostgreSQL work.
+
 Authority for Agent/Session work:
 
 ```text
