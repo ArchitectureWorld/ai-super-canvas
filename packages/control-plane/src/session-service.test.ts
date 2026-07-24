@@ -655,4 +655,61 @@ describe('SessionService Session creation', () => {
       reconciliation: repository.markRuntimeCommandReconciling.mock.calls,
     })).not.toContain(persistenceSentinel);
   });
+  it('coalesces concurrent dispatches for the same receipt while Runtime creation is in flight', async () => {
+    const repository = createSessionRepository();
+    repository.beginRuntimeDispatch
+      .mockResolvedValueOnce({
+        phase: 'runtime_dispatched',
+        dispatchAllowed: true,
+      })
+      .mockResolvedValueOnce({
+        phase: 'runtime_dispatched',
+        dispatchAllowed: false,
+      });
+    let resolveRuntimeSession: (value: {
+      externalSessionRef: string;
+      historyDigest: string;
+    }) => void;
+    const runtime = {
+      createSession: vi.fn().mockImplementation(
+        () => new Promise((resolve) => {
+          resolveRuntimeSession = resolve;
+        }),
+      ),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+    const request = {
+      actor,
+      commandId: ids.commandId,
+      workflowId: ids.workflowId,
+      agentBindingId: ids.bindingId,
+      title: 'Main Session',
+    };
+
+    const first = service.createRootSession(request);
+    await vi.waitFor(() => {
+      expect(runtime.createSession).toHaveBeenCalledOnce();
+    });
+    const second = service.createRootSession(request);
+    resolveRuntimeSession!({
+      externalSessionRef: 'fake-session-coalesced',
+      historyDigest: 'fake-history-coalesced',
+    });
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { sessionId: ids.sessionId, nodeId: ids.nodeId, status: 'active' },
+      { sessionId: ids.sessionId, nodeId: ids.nodeId, status: 'active' },
+    ]);
+    expect(repository.createRootSession).toHaveBeenCalledTimes(2);
+    expect(repository.beginRuntimeDispatch).toHaveBeenCalledOnce();
+    expect(runtime.createSession).toHaveBeenCalledOnce();
+    expect(repository.getSessionRuntimeContext).toHaveBeenCalledOnce();
+    expect(repository.recordRuntimeResourceKnown).toHaveBeenCalledOnce();
+    expect(repository.attachRuntimeSession).toHaveBeenCalledOnce();
+    expect(repository.markRuntimeCommandReconciling).not.toHaveBeenCalled();
+  });
 });

@@ -7,6 +7,7 @@ import {
 } from '@ai-super-canvas/ai';
 import type {
   ControlPlaneRepository,
+  CreatedSession,
   OrchestrationPhase,
   SessionRuntimeContext,
 } from '@ai-super-canvas/db';
@@ -148,6 +149,11 @@ function nonDispatchable(
 }
 
 export class SessionService {
+  private readonly activeSessionDispatches = new Map<
+    string,
+    Promise<CreatedSessionDto>
+  >();
+
   constructor(
     private readonly repository: ControlPlaneRepository,
     private readonly runtime: RuntimeAdapter,
@@ -196,6 +202,29 @@ export class SessionService {
       );
     }
 
+    const activeDispatch = this.activeSessionDispatches.get(
+      prepared.commandReceiptId,
+    );
+    if (activeDispatch) return activeDispatch;
+
+    const commandReceiptId = prepared.commandReceiptId;
+    const runner = Promise.resolve()
+      .then(() => this.dispatchPreparedRootSession(input, prepared))
+      .finally(() => {
+        if (
+          this.activeSessionDispatches.get(commandReceiptId) === runner
+        ) {
+          this.activeSessionDispatches.delete(commandReceiptId);
+        }
+      });
+    this.activeSessionDispatches.set(commandReceiptId, runner);
+    return runner;
+  }
+
+  private async dispatchPreparedRootSession(
+    input: CreateRootSessionInput,
+    prepared: CreatedSession,
+  ): Promise<CreatedSessionDto> {
     const dispatch = await this.repository.beginRuntimeDispatch({
       actor: input.actor,
       commandReceiptId: prepared.commandReceiptId,
