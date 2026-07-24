@@ -713,3 +713,269 @@ describe('SessionService Session creation', () => {
     expect(repository.markRuntimeCommandReconciling).not.toHaveBeenCalled();
   });
 });
+
+function preparedRun() {
+  return {
+    commandReceiptId: ids.receiptId,
+    phase: 'canvas_prepared' as const,
+    workflowId: ids.workflowId,
+    sessionId: ids.sessionId,
+    runId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    status: 'queued' as const,
+    prompt: {
+      canvasMessageId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      role: 'user' as const,
+      content: 'say fake',
+    },
+    runtime: {
+      binding: {
+        canvasAgentBindingId: ids.bindingId,
+        agentId: ids.agentId,
+        runtimeKind: 'fake',
+        isolationKey: 'local-alpha',
+      },
+      externalSessionRef: 'fake-session-1',
+      expectedHistoryDigest: 'sha256:before-run',
+      model: {
+        providerKey: 'fake',
+        modelKey: 'deterministic-v1',
+      },
+      toolPolicy: {
+        allowedToolKeys: [],
+        deniedToolKeys: [],
+        approvalRequiredToolKeys: [],
+      },
+      context: [],
+    },
+  };
+}
+
+function createRunRepository() {
+  return {
+    prepareRun: vi.fn().mockResolvedValue(preparedRun()),
+    beginRuntimeDispatch: vi.fn().mockResolvedValue({
+      phase: 'runtime_dispatched',
+      dispatchAllowed: true,
+    }),
+    recordRuntimeResourceKnown: vi.fn().mockResolvedValue(undefined),
+    attachRuntimeRun: vi.fn().mockResolvedValue(undefined),
+    markRuntimeCommandFailure: vi.fn().mockResolvedValue(undefined),
+    markRuntimeCommandReconciling: vi.fn().mockResolvedValue(undefined),
+    markRuntimeSessionUnavailable: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+describe('SessionService Run start', () => {
+  const request = {
+    actor,
+    commandId: ids.commandId,
+    idempotencyKey: 'browser-run-1',
+    sessionId: ids.sessionId,
+    content: 'say fake',
+  };
+
+  it('records and attaches a Runtime Run before starting the pump', async () => {
+    const repository = createRunRepository();
+    const runtime = {
+      startRun: vi.fn().mockResolvedValue({
+        externalRunRef: 'fake-run-1',
+        acceptedAt: new Date(0).toISOString(),
+      }),
+    };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).resolves.toEqual({
+      runId: preparedRun().runId,
+      status: 'running',
+    });
+    expect(repository.prepareRun).toHaveBeenCalledWith(request);
+    expect(runtime.startRun).toHaveBeenCalledWith({
+      commandId: request.commandId,
+      idempotencyKey: request.idempotencyKey,
+      binding: {
+        canvasAgentBindingId: ids.bindingId,
+        isolationKey: 'local-alpha',
+      },
+      canvasRunId: preparedRun().runId,
+      canvasSessionId: ids.sessionId,
+      externalSessionRef: 'fake-session-1',
+      expectedHistoryDigest: 'sha256:before-run',
+      prompt: preparedRun().prompt,
+      model: preparedRun().runtime.model,
+      toolPolicy: preparedRun().runtime.toolPolicy,
+      context: [],
+    });
+    expect(repository.prepareRun.mock.invocationCallOrder[0])
+      .toBeLessThan(repository.beginRuntimeDispatch.mock.invocationCallOrder[0]!);
+    expect(repository.beginRuntimeDispatch.mock.invocationCallOrder[0])
+      .toBeLessThan(runtime.startRun.mock.invocationCallOrder[0]!);
+    expect(runtime.startRun.mock.invocationCallOrder[0])
+      .toBeLessThan(repository.recordRuntimeResourceKnown.mock.invocationCallOrder[0]!);
+    expect(repository.recordRuntimeResourceKnown.mock.invocationCallOrder[0])
+      .toBeLessThan(repository.attachRuntimeRun.mock.invocationCallOrder[0]!);
+    expect(repository.attachRuntimeRun.mock.invocationCallOrder[0])
+      .toBeLessThan(eventPump.start.mock.invocationCallOrder[0]!);
+    expect(eventPump.start).toHaveBeenCalledWith({
+      actor,
+      runId: preparedRun().runId,
+    });
+  });
+
+  it('reuses an attached active Run without dispatching it again', async () => {
+    const repository = createRunRepository();
+    repository.prepareRun.mockResolvedValueOnce({
+      ...preparedRun(),
+      phase: 'attached',
+      status: 'running',
+    });
+    const runtime = { startRun: vi.fn() };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).resolves.toEqual({
+      runId: preparedRun().runId,
+      status: 'running',
+    });
+    expect(repository.beginRuntimeDispatch).not.toHaveBeenCalled();
+    expect(runtime.startRun).not.toHaveBeenCalled();
+    expect(eventPump.start).toHaveBeenCalledWith({
+      actor,
+      runId: preparedRun().runId,
+    });
+  });
+
+  it('marks a missing Fake Session unavailable on a not-applied start', async () => {
+    const runtimeSentinel = 'SENTINEL-OLD-PROCESS-LOCAL-REF';
+    const repository = createRunRepository();
+    const runtime = {
+      startRun: vi.fn().mockRejectedValue(
+        new RuntimeAdapterError(
+          'session_not_found',
+          runtimeSentinel,
+          false,
+          'not-applied',
+        ),
+      ),
+    };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    let caught: unknown;
+    try {
+      await service.startRun(request);
+    } catch (reason) {
+      caught = reason;
+    }
+
+    expect(caught).toMatchObject({
+      code: 'runtime_session_unavailable',
+      retryable: false,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(repository.markRuntimeSessionUnavailable).toHaveBeenCalledWith({
+      actor,
+      sessionId: ids.sessionId,
+      error: 'runtime_adapter:session_not_found:not-applied',
+    });
+    expect(repository.markRuntimeCommandFailure).toHaveBeenCalledWith({
+      actor,
+      commandReceiptId: ids.receiptId,
+      retryable: false,
+      error: 'runtime_adapter:session_not_found:not-applied',
+    });
+    expect(repository.markRuntimeCommandReconciling).not.toHaveBeenCalled();
+    expect(repository.attachRuntimeRun).not.toHaveBeenCalled();
+    expect(eventPump.start).not.toHaveBeenCalled();
+    expect(String(caught)).not.toContain(runtimeSentinel);
+    expect(JSON.stringify(caught)).not.toContain(runtimeSentinel);
+    expect(JSON.stringify({
+      unavailable: repository.markRuntimeSessionUnavailable.mock.calls,
+      failure: repository.markRuntimeCommandFailure.mock.calls,
+    })).not.toContain(runtimeSentinel);
+  });
+
+  it('reconciles an unknown Runtime outcome without attaching or pumping', async () => {
+    const repository = createRunRepository();
+    const runtime = {
+      startRun: vi.fn().mockRejectedValue(
+        new RuntimeAdapterError(
+          'runtime_unavailable',
+          'timeout',
+          true,
+          'unknown',
+        ),
+      ),
+    };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).rejects.toMatchObject({
+      code: 'command_requires_reconciliation',
+      commandReceiptId: ids.receiptId,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledOnce();
+    expect(repository.markRuntimeCommandFailure).not.toHaveBeenCalled();
+    expect(repository.markRuntimeSessionUnavailable).not.toHaveBeenCalled();
+    expect(repository.attachRuntimeRun).not.toHaveBeenCalled();
+    expect(eventPump.start).not.toHaveBeenCalled();
+  });
+
+  it('reconciles an accepted Runtime response that omits externalRunRef', async () => {
+    const repository = createRunRepository();
+    const runtime = {
+      startRun: vi.fn().mockResolvedValue({
+        acceptedAt: new Date(0).toISOString(),
+      }),
+    };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).rejects.toMatchObject({
+      code: 'command_requires_reconciliation',
+      commandReceiptId: ids.receiptId,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledWith({
+      actor,
+      commandReceiptId: ids.receiptId,
+      externalResourceKind: 'run',
+      lookupMetadata: {
+        commandId: request.commandId,
+        canvasRunId: preparedRun().runId,
+      },
+      error: 'runtime_run_ref_missing',
+    });
+    expect(repository.recordRuntimeResourceKnown).not.toHaveBeenCalled();
+    expect(repository.attachRuntimeRun).not.toHaveBeenCalled();
+    expect(eventPump.start).not.toHaveBeenCalled();
+  });
+});

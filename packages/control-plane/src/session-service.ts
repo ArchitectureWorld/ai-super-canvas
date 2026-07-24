@@ -9,6 +9,7 @@ import type {
   ControlPlaneRepository,
   CreatedSession,
   OrchestrationPhase,
+  PreparedRun,
   SessionRuntimeContext,
 } from '@ai-super-canvas/db';
 
@@ -17,10 +18,13 @@ import type {
   CreatedSessionDto,
   CreateRootSessionInput,
   LocalAlphaBootstrapDto,
+  StartedRunDto,
+  StartSessionRunInput,
 } from './dto';
 import {
   commandRequiresReconciliation,
   runtimeOperationFailed,
+  runtimeSessionUnavailable,
 } from './errors';
 import type { RunEventPumpPort } from './run-event-pump';
 
@@ -154,6 +158,11 @@ export class SessionService {
     Promise<CreatedSessionDto>
   >();
 
+  private readonly activeRunDispatches = new Map<
+    string,
+    Promise<StartedRunDto>
+  >();
+
   constructor(
     private readonly repository: ControlPlaneRepository,
     private readonly runtime: RuntimeAdapter,
@@ -219,6 +228,235 @@ export class SessionService {
       });
     this.activeSessionDispatches.set(commandReceiptId, runner);
     return runner;
+  }
+
+  async startRun(
+    input: StartSessionRunInput,
+  ): Promise<StartedRunDto> {
+    const prepared = await this.repository.prepareRun(input);
+
+    if (prepared.phase === 'attached') {
+      return this.handoffAttachedRun(input, prepared);
+    }
+    if (prepared.phase === 'terminal_failure') {
+      return { runId: prepared.runId, status: 'failed' };
+    }
+
+    const activeDispatch = this.activeRunDispatches.get(
+      prepared.commandReceiptId,
+    );
+    if (activeDispatch) return activeDispatch;
+
+    const commandReceiptId = prepared.commandReceiptId;
+    const runner = Promise.resolve()
+      .then(() => this.dispatchPreparedRun(input, prepared))
+      .finally(() => {
+        if (this.activeRunDispatches.get(commandReceiptId) === runner) {
+          this.activeRunDispatches.delete(commandReceiptId);
+        }
+      });
+    this.activeRunDispatches.set(commandReceiptId, runner);
+    return runner;
+  }
+
+  private handoffAttachedRun(
+    input: StartSessionRunInput,
+    prepared: PreparedRun,
+  ): StartedRunDto {
+    if (prepared.status === 'reconciling') {
+      throw commandRequiresReconciliation(prepared.commandReceiptId);
+    }
+    if (
+      prepared.status === 'queued'
+      || prepared.status === 'running'
+      || prepared.status === 'waiting_approval'
+    ) {
+      this.eventPump.start({
+        actor: input.actor,
+        runId: prepared.runId,
+      });
+    }
+    return { runId: prepared.runId, status: prepared.status };
+  }
+
+  private async requireRunReconciliation(
+    input: StartSessionRunInput,
+    prepared: PreparedRun,
+    error: string,
+    externalRunRef?: string,
+  ): Promise<never> {
+    await confirmPersistence(
+      () => this.repository.markRuntimeCommandReconciling({
+        actor: input.actor,
+        commandReceiptId: prepared.commandReceiptId,
+        externalResourceKind: 'run',
+        ...(externalRunRef === undefined
+          ? {}
+          : { externalResourceRef: externalRunRef }),
+        lookupMetadata: {
+          commandId: input.commandId,
+          canvasRunId: prepared.runId,
+        },
+        error,
+      }),
+    );
+    throw commandRequiresReconciliation(prepared.commandReceiptId);
+  }
+
+  private async dispatchPreparedRun(
+    input: StartSessionRunInput,
+    prepared: PreparedRun,
+  ): Promise<StartedRunDto> {
+    const dispatch = await this.repository.beginRuntimeDispatch({
+      actor: input.actor,
+      commandReceiptId: prepared.commandReceiptId,
+    });
+    if (!dispatch.dispatchAllowed) {
+      if (dispatch.phase === 'attached') {
+        this.eventPump.start({
+          actor: input.actor,
+          runId: prepared.runId,
+        });
+        return { runId: prepared.runId, status: 'running' };
+      }
+      if (dispatch.phase === 'terminal_failure') {
+        return { runId: prepared.runId, status: 'failed' };
+      }
+      return this.requireRunReconciliation(
+        input,
+        prepared,
+        'runtime_dispatch_persistence_unconfirmed',
+      );
+    }
+
+    let failureCategory = 'runtime_run_input_build_failed';
+    let knownExternalRunRef: string | undefined;
+    try {
+      const binding: RuntimeBindingContext = {
+        canvasAgentBindingId:
+          prepared.runtime.binding.canvasAgentBindingId,
+        isolationKey: prepared.runtime.binding.isolationKey,
+        ...(prepared.runtime.binding.endpointRef === undefined
+          ? {}
+          : { endpointRef: prepared.runtime.binding.endpointRef }),
+        ...(prepared.runtime.binding.secretRef === undefined
+          ? {}
+          : { secretRef: prepared.runtime.binding.secretRef }),
+      };
+      const runtimeInput: Parameters<RuntimeAdapter['startRun']>[0] = {
+        commandId: input.commandId,
+        idempotencyKey: input.idempotencyKey,
+        binding,
+        canvasRunId: prepared.runId,
+        canvasSessionId: prepared.sessionId,
+        externalSessionRef: prepared.runtime.externalSessionRef,
+        expectedHistoryDigest: prepared.runtime.expectedHistoryDigest,
+        prompt: prepared.prompt,
+        model: prepared.runtime.model,
+        toolPolicy: prepared.runtime.toolPolicy,
+        context: prepared.runtime.context,
+      };
+
+      failureCategory = 'runtime_run_start_failed';
+      let runtimeRun: Awaited<ReturnType<RuntimeAdapter['startRun']>>;
+      try {
+        runtimeRun = await this.runtime.startRun(runtimeInput);
+      } catch (reason) {
+        if (
+          reason instanceof RuntimeAdapterError
+          && reason.operationEffect === 'not-applied'
+        ) {
+          throw new RuntimeNotAppliedFailure(reason);
+        }
+        throw reason;
+      }
+
+      failureCategory = 'runtime_run_ref_missing';
+      knownExternalRunRef = runtimeRun.externalRunRef?.trim()
+        ? runtimeRun.externalRunRef
+        : undefined;
+      if (!knownExternalRunRef) {
+        throw new Error(failureCategory);
+      }
+
+      failureCategory = 'runtime_run_record_failed';
+      await this.repository.recordRuntimeResourceKnown({
+        actor: input.actor,
+        commandReceiptId: prepared.commandReceiptId,
+        externalResourceKind: 'run',
+        externalResourceRef: knownExternalRunRef,
+      });
+
+      failureCategory = 'runtime_run_attach_failed';
+      await this.repository.attachRuntimeRun({
+        actor: input.actor,
+        commandReceiptId: prepared.commandReceiptId,
+        runtimeRun: {
+          externalRunRef: knownExternalRunRef,
+          acceptedAt: runtimeRun.acceptedAt,
+        },
+      });
+    } catch (reason) {
+      if (reason instanceof RuntimeNotAppliedFailure) {
+        const adapterError = reason.adapterError;
+        const error = runtimeFailureCategory(
+          adapterError,
+          failureCategory,
+        );
+        if (adapterError.code === 'session_not_found') {
+          const unavailableConfirmed = await confirmPersistence(
+            () => this.repository.markRuntimeSessionUnavailable({
+              actor: input.actor,
+              sessionId: prepared.sessionId,
+              error,
+            }),
+          );
+          if (!unavailableConfirmed) {
+            return this.requireRunReconciliation(
+              input,
+              prepared,
+              error,
+            );
+          }
+        }
+
+        const failureConfirmed = await confirmPersistence(
+          () => this.repository.markRuntimeCommandFailure({
+            actor: input.actor,
+            commandReceiptId: prepared.commandReceiptId,
+            retryable: adapterError.retryable,
+            error,
+          }),
+        );
+        if (!failureConfirmed) {
+          return this.requireRunReconciliation(
+            input,
+            prepared,
+            error,
+          );
+        }
+        if (adapterError.code === 'session_not_found') {
+          throw runtimeSessionUnavailable(prepared.commandReceiptId);
+        }
+        throw runtimeOperationFailed(
+          prepared.commandReceiptId,
+          adapterError.retryable,
+        );
+      }
+
+      return this.requireRunReconciliation(
+        input,
+        prepared,
+        runtimeFailureCategory(reason, failureCategory),
+        knownExternalRunRef,
+      );
+    }
+
+    this.eventPump.start({
+      actor: input.actor,
+      runId: prepared.runId,
+    });
+    return { runId: prepared.runId, status: 'running' };
   }
 
   private async dispatchPreparedRootSession(
