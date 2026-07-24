@@ -227,6 +227,12 @@ export const sessionRuntimeRefs = pgTable(
       table.agentBindingId,
       table.externalSessionRef,
     ),
+    unique('session_runtime_refs_session_binding_id_ref_unique').on(
+      table.sessionId,
+      table.agentBindingId,
+      table.id,
+      table.externalSessionRef,
+    ),
     foreignKey({
       name: 'session_runtime_refs_binding_fk',
       columns: [table.sessionId, table.agentBindingId],
