@@ -1,4 +1,5 @@
 export type ControlPlaneApplicationErrorCode =
+  | 'command_persistence_unconfirmed'
   | 'command_requires_reconciliation'
   | 'runtime_operation_failed'
   | 'runtime_session_unavailable';
@@ -14,6 +15,17 @@ export class ControlPlaneApplicationError extends Error {
     super(message, options);
     this.name = 'ControlPlaneApplicationError';
   }
+}
+
+export function commandPersistenceUnconfirmed(
+  commandReceiptId: string,
+): ControlPlaneApplicationError {
+  return new ControlPlaneApplicationError(
+    'command_persistence_unconfirmed',
+    'Runtime command persistence could not be confirmed',
+    true,
+    commandReceiptId,
+  );
 }
 
 export function commandRequiresReconciliation(

@@ -22,6 +22,7 @@ import type {
   StartSessionRunInput,
 } from './dto';
 import {
+  commandPersistenceUnconfirmed,
   commandRequiresReconciliation,
   runtimeOperationFailed,
   runtimeSessionUnavailable,
@@ -285,7 +286,7 @@ export class SessionService {
     error: string,
     externalRunRef?: string,
   ): Promise<never> {
-    await confirmPersistence(
+    const reconciliationConfirmed = await confirmPersistence(
       () => this.repository.markRuntimeCommandReconciling({
         actor: input.actor,
         commandReceiptId: prepared.commandReceiptId,
@@ -300,6 +301,9 @@ export class SessionService {
         error,
       }),
     );
+    if (!reconciliationConfirmed) {
+      throw commandPersistenceUnconfirmed(prepared.commandReceiptId);
+    }
     throw commandRequiresReconciliation(prepared.commandReceiptId);
   }
 
@@ -313,11 +317,18 @@ export class SessionService {
     });
     if (!dispatch.dispatchAllowed) {
       if (dispatch.phase === 'attached') {
-        this.eventPump.start({
-          actor: input.actor,
-          runId: prepared.runId,
-        });
-        return { runId: prepared.runId, status: 'running' };
+        const refreshed = await this.repository.prepareRun(input);
+        if (refreshed.phase === 'attached') {
+          return this.handoffAttachedRun(input, refreshed);
+        }
+        if (refreshed.phase === 'terminal_failure') {
+          return { runId: refreshed.runId, status: 'failed' };
+        }
+        return this.requireRunReconciliation(
+          input,
+          refreshed,
+          'runtime_attached_replay_unconfirmed',
+        );
       }
       if (dispatch.phase === 'terminal_failure') {
         return { runId: prepared.runId, status: 'failed' };

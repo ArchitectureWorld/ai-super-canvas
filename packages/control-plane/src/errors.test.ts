@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  commandPersistenceUnconfirmed,
   commandRequiresReconciliation,
   ControlPlaneApplicationError,
   runtimeOperationFailed,
@@ -46,6 +47,19 @@ describe('application error factories', () => {
       retryable: true,
       commandReceiptId: '33333333-3333-4333-8333-333333333333',
       cause,
+    });
+  });
+
+  it('creates a safe persistence-unconfirmed error', () => {
+    expect(
+      commandPersistenceUnconfirmed(
+        '33333333-3333-4333-8333-333333333333',
+      ),
+    ).toMatchObject({
+      code: 'command_persistence_unconfirmed',
+      message: 'Runtime command persistence could not be confirmed',
+      retryable: true,
+      commandReceiptId: '33333333-3333-4333-8333-333333333333',
     });
   });
 

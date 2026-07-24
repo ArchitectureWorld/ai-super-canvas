@@ -978,4 +978,394 @@ describe('SessionService Run start', () => {
     expect(repository.attachRuntimeRun).not.toHaveBeenCalled();
     expect(eventPump.start).not.toHaveBeenCalled();
   });
+
+  it('re-prepares after an attached lease race and hands off the latest status', async () => {
+    const repository = createRunRepository();
+    repository.prepareRun
+      .mockResolvedValueOnce(preparedRun())
+      .mockResolvedValueOnce({
+        ...preparedRun(),
+        phase: 'attached',
+        status: 'running',
+      });
+    repository.beginRuntimeDispatch.mockResolvedValueOnce({
+      phase: 'attached',
+      dispatchAllowed: false,
+    });
+    const runtime = { startRun: vi.fn() };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).resolves.toEqual({
+      runId: preparedRun().runId,
+      status: 'running',
+    });
+    expect(repository.prepareRun).toHaveBeenCalledTimes(2);
+    expect(runtime.startRun).not.toHaveBeenCalled();
+    expect(eventPump.start).toHaveBeenCalledWith({
+      actor,
+      runId: preparedRun().runId,
+    });
+  });
+
+  it('re-prepares an attached terminal lease race without starting the pump', async () => {
+    const repository = createRunRepository();
+    repository.prepareRun
+      .mockResolvedValueOnce(preparedRun())
+      .mockResolvedValueOnce({
+        ...preparedRun(),
+        phase: 'attached',
+        status: 'succeeded',
+      });
+    repository.beginRuntimeDispatch.mockResolvedValueOnce({
+      phase: 'attached',
+      dispatchAllowed: false,
+    });
+    const runtime = { startRun: vi.fn() };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).resolves.toEqual({
+      runId: preparedRun().runId,
+      status: 'succeeded',
+    });
+    expect(repository.prepareRun).toHaveBeenCalledTimes(2);
+    expect(runtime.startRun).not.toHaveBeenCalled();
+    expect(eventPump.start).not.toHaveBeenCalled();
+  });
+
+  it('re-prepares an attached reconciling lease race without starting the pump', async () => {
+    const repository = createRunRepository();
+    repository.prepareRun
+      .mockResolvedValueOnce(preparedRun())
+      .mockResolvedValueOnce({
+        ...preparedRun(),
+        phase: 'attached',
+        status: 'reconciling',
+      });
+    repository.beginRuntimeDispatch.mockResolvedValueOnce({
+      phase: 'attached',
+      dispatchAllowed: false,
+    });
+    const runtime = { startRun: vi.fn() };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).rejects.toMatchObject({
+      code: 'command_requires_reconciliation',
+      commandReceiptId: ids.receiptId,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(repository.prepareRun).toHaveBeenCalledTimes(2);
+    expect(runtime.startRun).not.toHaveBeenCalled();
+    expect(eventPump.start).not.toHaveBeenCalled();
+  });
+
+  it('returns a safe persistence-unconfirmed error when reconciliation cannot be stored', async () => {
+    const runtimeSentinel = 'SENTINEL-RUN-UNKNOWN-OUTCOME';
+    const persistenceSentinel = 'SENTINEL-RUN-RECONCILIATION-PERSISTENCE';
+    const repository = createRunRepository();
+    repository.markRuntimeCommandReconciling.mockRejectedValueOnce(
+      new Error(persistenceSentinel),
+    );
+    const runtime = {
+      startRun: vi.fn().mockRejectedValue(
+        new Error(runtimeSentinel),
+      ),
+    };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    let caught: unknown;
+    try {
+      await service.startRun(request);
+    } catch (reason) {
+      caught = reason;
+    }
+
+    expect(caught).toMatchObject({
+      code: 'command_persistence_unconfirmed',
+      message: 'Runtime command persistence could not be confirmed',
+      retryable: true,
+      commandReceiptId: ids.receiptId,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(caught).not.toHaveProperty('cause');
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledOnce();
+    expect(String(caught)).not.toContain(runtimeSentinel);
+    expect(String(caught)).not.toContain(persistenceSentinel);
+    expect(JSON.stringify(caught)).not.toContain(runtimeSentinel);
+    expect(JSON.stringify(caught)).not.toContain(persistenceSentinel);
+  });
+
+  it('returns persistence-unconfirmed while retaining a known external Run ref', async () => {
+    const persistenceSentinel = 'SENTINEL-KNOWN-RUN-RECONCILIATION';
+    const repository = createRunRepository();
+    repository.recordRuntimeResourceKnown.mockRejectedValueOnce(
+      new Error('record response lost'),
+    );
+    repository.markRuntimeCommandReconciling.mockRejectedValueOnce(
+      new Error(persistenceSentinel),
+    );
+    const runtime = {
+      startRun: vi.fn().mockResolvedValue({
+        externalRunRef: 'fake-run-known-unconfirmed',
+        acceptedAt: new Date(0).toISOString(),
+      }),
+    };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    let caught: unknown;
+    try {
+      await service.startRun(request);
+    } catch (reason) {
+      caught = reason;
+    }
+
+    expect(caught).toMatchObject({
+      code: 'command_persistence_unconfirmed',
+      commandReceiptId: ids.receiptId,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(caught).not.toHaveProperty('cause');
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledWith({
+      actor,
+      commandReceiptId: ids.receiptId,
+      externalResourceKind: 'run',
+      externalResourceRef: 'fake-run-known-unconfirmed',
+      lookupMetadata: {
+        commandId: request.commandId,
+        canvasRunId: preparedRun().runId,
+      },
+      error: 'runtime_run_record_failed',
+    });
+    expect(repository.attachRuntimeRun).not.toHaveBeenCalled();
+    expect(eventPump.start).not.toHaveBeenCalled();
+    expect(String(caught)).not.toContain(persistenceSentinel);
+    expect(JSON.stringify(caught)).not.toContain(persistenceSentinel);
+  });
+
+  it('coalesces a Run receipt in flight and releases only its owning runner', async () => {
+    const repository = createRunRepository();
+    let resolveRuntimeRun!: (value: {
+      externalRunRef: string;
+      acceptedAt: string;
+    }) => void;
+    const runtime = {
+      startRun: vi.fn()
+        .mockImplementationOnce(
+          () => new Promise<{
+            externalRunRef: string;
+            acceptedAt: string;
+          }>((resolve) => {
+            resolveRuntimeRun = resolve;
+          }),
+        )
+        .mockResolvedValueOnce({
+          externalRunRef: 'fake-run-after-cleanup',
+          acceptedAt: new Date(1).toISOString(),
+        }),
+    };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    const first = service.startRun(request);
+    const second = service.startRun({ ...request });
+    await vi.waitFor(() => {
+      expect(runtime.startRun).toHaveBeenCalledOnce();
+    });
+    resolveRuntimeRun({
+      externalRunRef: 'fake-run-single-flight',
+      acceptedAt: new Date(0).toISOString(),
+    });
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { runId: preparedRun().runId, status: 'running' },
+      { runId: preparedRun().runId, status: 'running' },
+    ]);
+    expect(repository.prepareRun).toHaveBeenCalledTimes(2);
+    expect(repository.beginRuntimeDispatch).toHaveBeenCalledOnce();
+    expect(runtime.startRun).toHaveBeenCalledOnce();
+    expect(repository.recordRuntimeResourceKnown).toHaveBeenCalledOnce();
+    expect(repository.attachRuntimeRun).toHaveBeenCalledOnce();
+    expect(eventPump.start).toHaveBeenCalledOnce();
+
+    await expect(service.startRun({ ...request })).resolves.toEqual({
+      runId: preparedRun().runId,
+      status: 'running',
+    });
+    expect(runtime.startRun).toHaveBeenCalledTimes(2);
+    expect(repository.attachRuntimeRun).toHaveBeenCalledTimes(2);
+    expect(eventPump.start).toHaveBeenCalledTimes(2);
+  });
+
+  it('reconciles a runtime-dispatched replay without redispatching', async () => {
+    const repository = createRunRepository();
+    repository.beginRuntimeDispatch.mockResolvedValueOnce({
+      phase: 'runtime_dispatched',
+      dispatchAllowed: false,
+    });
+    const runtime = { startRun: vi.fn() };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).rejects.toMatchObject({
+      code: 'command_requires_reconciliation',
+      commandReceiptId: ids.receiptId,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(runtime.startRun).not.toHaveBeenCalled();
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledWith({
+      actor,
+      commandReceiptId: ids.receiptId,
+      externalResourceKind: 'run',
+      lookupMetadata: {
+        commandId: request.commandId,
+        canvasRunId: preparedRun().runId,
+      },
+      error: 'runtime_dispatch_persistence_unconfirmed',
+    });
+  });
+
+  it('retains a known external Run ref when recording it fails', async () => {
+    const repository = createRunRepository();
+    repository.recordRuntimeResourceKnown.mockRejectedValueOnce(
+      new Error('record response lost'),
+    );
+    const runtime = {
+      startRun: vi.fn().mockResolvedValue({
+        externalRunRef: 'fake-run-record-lost',
+        acceptedAt: new Date(0).toISOString(),
+      }),
+    };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).rejects.toMatchObject({
+      code: 'command_requires_reconciliation',
+      commandReceiptId: ids.receiptId,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledWith({
+      actor,
+      commandReceiptId: ids.receiptId,
+      externalResourceKind: 'run',
+      externalResourceRef: 'fake-run-record-lost',
+      lookupMetadata: {
+        commandId: request.commandId,
+        canvasRunId: preparedRun().runId,
+      },
+      error: 'runtime_run_record_failed',
+    });
+    expect(repository.attachRuntimeRun).not.toHaveBeenCalled();
+    expect(eventPump.start).not.toHaveBeenCalled();
+  });
+
+  it('retains a known external Run ref when attachment fails', async () => {
+    const repository = createRunRepository();
+    repository.attachRuntimeRun.mockRejectedValueOnce(
+      new Error('attach response lost'),
+    );
+    const runtime = {
+      startRun: vi.fn().mockResolvedValue({
+        externalRunRef: 'fake-run-attach-lost',
+        acceptedAt: new Date(0).toISOString(),
+      }),
+    };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).rejects.toMatchObject({
+      code: 'command_requires_reconciliation',
+      commandReceiptId: ids.receiptId,
+    } satisfies Partial<ControlPlaneApplicationError>);
+    expect(repository.recordRuntimeResourceKnown).toHaveBeenCalledOnce();
+    expect(repository.markRuntimeCommandReconciling).toHaveBeenCalledWith({
+      actor,
+      commandReceiptId: ids.receiptId,
+      externalResourceKind: 'run',
+      externalResourceRef: 'fake-run-attach-lost',
+      lookupMetadata: {
+        commandId: request.commandId,
+        canvasRunId: preparedRun().runId,
+      },
+      error: 'runtime_run_attach_failed',
+    });
+    expect(eventPump.start).not.toHaveBeenCalled();
+  });
+
+  it('accepts an already-active pump handoff after attachment', async () => {
+    const repository = createRunRepository();
+    repository.prepareRun.mockResolvedValueOnce({
+      ...preparedRun(),
+      phase: 'attached',
+      status: 'running',
+    });
+    const runtime = { startRun: vi.fn() };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('already-active' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(service.startRun(request)).resolves.toEqual({
+      runId: preparedRun().runId,
+      status: 'running',
+    });
+    expect(runtime.startRun).not.toHaveBeenCalled();
+    expect(eventPump.start).toHaveBeenCalledOnce();
+  });
 });
