@@ -39,7 +39,6 @@ import {
   ActiveRunConflictError,
   RunIdempotencyConflictError,
   RuntimeEventConflictError,
-  RunRuntimeContextUnavailableError,
   RunStateConflictError,
   type PersistableRunEvent,
   type PreparedRun,
@@ -103,6 +102,7 @@ interface AuthorizationRow {
 
 interface PrepareRunSessionRow {
   status: string;
+  runtime_session_ref_id: string | null;
   external_session_ref: string | null;
   runtime_metadata: Record<string, unknown> | null;
 }
@@ -139,13 +139,9 @@ interface PreparedRunReplayRow {
   message_workflow_id: string;
   message_role: string;
   message_content: unknown;
-  binding_agent_id: string;
-  binding_runtime_kind: string;
-  binding_isolation_key: string;
-  binding_endpoint_ref: string | null;
-  binding_secret_ref: string | null;
+  binding_snapshot: unknown;
   external_session_ref: string;
-  expected_history_digest: string | null;
+  expected_history_digest: string;
 }
 
 interface StoredModelRow {
@@ -188,7 +184,8 @@ interface AuthorizedRunRow extends AuthorizationRow {
   session_id: string;
   status: StoredRunStatus;
   runtime_run_ref: string | null;
-  external_session_ref: string | null;
+  runtime_session_external_ref: string;
+  runtime_binding_snapshot: unknown;
 }
 
 interface StoredRunEventRow {
@@ -556,15 +553,12 @@ function canonicalValuesEqual(left: unknown, right: unknown): boolean {
 function dispatchAuthorityMatches(
   row: PreparedRunReplayRow,
   binding: RuntimeBindingSnapshot,
+  storedBinding: RuntimeBindingSnapshot,
   externalSessionRef: string,
   expectedHistoryDigest: string,
 ): boolean {
   return binding.canvasAgentBindingId === row.agent_binding_id
-    && binding.agentId === row.binding_agent_id
-    && binding.runtimeKind === row.binding_runtime_kind
-    && binding.isolationKey === row.binding_isolation_key
-    && (binding.endpointRef ?? null) === row.binding_endpoint_ref
-    && (binding.secretRef ?? null) === row.binding_secret_ref
+    && canonicalValuesEqual(binding, storedBinding)
     && externalSessionRef === row.external_session_ref
     && expectedHistoryDigest === row.expected_history_digest;
 }
@@ -640,6 +634,7 @@ function parsePreparedRunReplay(
   }
 
   const binding = parseRuntimeBindingSnapshot(runtime.binding);
+  const storedBinding = parseRuntimeBindingSnapshot(row.binding_snapshot);
   const model = parseRuntimeModelSnapshot(runtime.model);
   const toolPolicy = parsePreparedRunToolPolicy(runtime.toolPolicy);
   const context = parseRuntimeContextSnapshots(runtime.context);
@@ -660,6 +655,7 @@ function parsePreparedRunReplay(
     || !dispatchAuthorityMatches(
       row,
       binding,
+      storedBinding,
       runtime.externalSessionRef,
       runtime.expectedHistoryDigest,
     )
@@ -682,9 +678,9 @@ function parsePreparedRunReplay(
       content: prompt.content,
     },
     runtime: {
-      binding,
-      externalSessionRef: runtime.externalSessionRef,
-      expectedHistoryDigest: runtime.expectedHistoryDigest,
+      binding: storedBinding,
+      externalSessionRef: row.external_session_ref,
+      expectedHistoryDigest: row.expected_history_digest,
       model: storedModel,
       toolPolicy: storedToolPolicy,
       context: storedContext,
@@ -1051,7 +1047,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
             binding.runtime_kind::text AS runtime_kind, binding.isolation_key,
             binding.endpoint_ref, binding.secret_ref,
             run.id AS run_id, run.session_id, run.status::text AS status,
-            run.runtime_run_ref, runtime_ref.external_session_ref
+            run.runtime_run_ref, run.runtime_session_external_ref,
+            run.runtime_binding_snapshot
           FROM runs run
           JOIN sessions session ON session.id = run.session_id
           JOIN workflows workflow ON workflow.id = session.workflow_id
@@ -1063,10 +1060,6 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
            AND member.account_id = account.id
           JOIN agent_bindings binding ON binding.id = run.agent_binding_id
           JOIN agents agent ON agent.id = binding.agent_id AND agent.status = 'active'
-          LEFT JOIN session_runtime_refs runtime_ref
-            ON runtime_ref.session_id = session.id
-           AND runtime_ref.is_primary = true
-           AND runtime_ref.status = 'active'
           WHERE run.id = ${runId}
             AND member.role = ANY(${allowedRoles})
             AND binding.status IN ('ready', 'degraded')
@@ -1087,7 +1080,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
             binding.runtime_kind::text AS runtime_kind, binding.isolation_key,
             binding.endpoint_ref, binding.secret_ref,
             run.id AS run_id, run.session_id, run.status::text AS status,
-            run.runtime_run_ref, runtime_ref.external_session_ref
+            run.runtime_run_ref, run.runtime_session_external_ref,
+            run.runtime_binding_snapshot
           FROM runs run
           JOIN sessions session ON session.id = run.session_id
           JOIN workflows workflow ON workflow.id = session.workflow_id
@@ -1099,10 +1093,6 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
            AND member.account_id = account.id
           JOIN agent_bindings binding ON binding.id = run.agent_binding_id
           JOIN agents agent ON agent.id = binding.agent_id AND agent.status = 'active'
-          LEFT JOIN session_runtime_refs runtime_ref
-            ON runtime_ref.session_id = session.id
-           AND runtime_ref.is_primary = true
-           AND runtime_ref.status = 'active'
           WHERE run.id = ${runId}
             AND member.role = ANY(${allowedRoles})
             AND binding.status IN ('ready', 'degraded')
@@ -2038,21 +2028,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
             message.session_id AS message_session_id,
             message.workflow_id AS message_workflow_id,
             message.role::text AS message_role, message.content AS message_content,
-            binding.agent_id AS binding_agent_id,
-            binding.runtime_kind::text AS binding_runtime_kind,
-            binding.isolation_key AS binding_isolation_key,
-            binding.endpoint_ref AS binding_endpoint_ref,
-            binding.secret_ref AS binding_secret_ref,
-            runtime_ref.external_session_ref,
-            runtime_ref.metadata ->> 'historyDigest' AS expected_history_digest
+            run.runtime_binding_snapshot AS binding_snapshot,
+            run.runtime_session_external_ref AS external_session_ref,
+            run.expected_history_digest
           FROM runs run
           JOIN sessions session ON session.id = run.session_id
-          JOIN agent_bindings binding ON binding.id = run.agent_binding_id
-          JOIN session_runtime_refs runtime_ref
-            ON runtime_ref.session_id = run.session_id
-           AND runtime_ref.agent_binding_id = run.agent_binding_id
-           AND runtime_ref.is_primary = true
-           AND runtime_ref.status = 'active'
           JOIN messages message
             ON message.id = run.trigger_message_id
            AND message.session_id = run.session_id
@@ -2074,6 +2054,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
 
       const [session] = await tx<PrepareRunSessionRow[]>`
         SELECT session.status::text AS status,
+          runtime_ref.id AS runtime_session_ref_id,
           runtime_ref.external_session_ref,
           runtime_ref.metadata AS runtime_metadata
         FROM sessions session
@@ -2086,7 +2067,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (!session || session.status !== 'active') {
         throw new Error('Session must be active to prepare a Run');
       }
-      if (session.external_session_ref === null) {
+      if (
+        session.runtime_session_ref_id === null
+        || session.external_session_ref === null
+      ) {
         throw new Error('Session has no active primary Runtime reference');
       }
       const historyDigest = session.runtime_metadata?.historyDigest;
@@ -2156,20 +2140,6 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         )
       `;
 
-      const runId = randomUUID();
-      await tx`
-        INSERT INTO runs (
-          id, session_id, agent_binding_id, config_revision_id,
-          trigger_message_id, idempotency_key, status, model_snapshot,
-          tool_policy_snapshot, context_policy_snapshot
-        ) VALUES (
-          ${runId}, ${input.sessionId}, ${authorization.agent_binding_id}, ${config.id},
-          ${canvasMessageId}, ${input.idempotencyKey}, 'queued', ${tx.json(model)},
-          ${tx.json(toolPolicy as unknown as postgres.JSONValue)},
-          ${tx.json(context as unknown as postgres.JSONValue)}
-        )
-      `;
-
       const binding: RuntimeBindingSnapshot = {
         canvasAgentBindingId: authorization.agent_binding_id,
         agentId: authorization.agent_id,
@@ -2182,6 +2152,25 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           ? {}
           : { secretRef: authorization.secret_ref }),
       };
+      const runId = randomUUID();
+      await tx`
+        INSERT INTO runs (
+          id, session_id, agent_binding_id, config_revision_id,
+          trigger_message_id, idempotency_key, status,
+          runtime_session_ref_id, runtime_session_external_ref,
+          expected_history_digest, runtime_binding_snapshot,
+          model_snapshot, tool_policy_snapshot, context_policy_snapshot
+        ) VALUES (
+          ${runId}, ${input.sessionId}, ${authorization.agent_binding_id}, ${config.id},
+          ${canvasMessageId}, ${input.idempotencyKey}, 'queued',
+          ${session.runtime_session_ref_id}, ${session.external_session_ref},
+          ${historyDigest}, ${tx.json(binding as unknown as postgres.JSONValue)},
+          ${tx.json(model)},
+          ${tx.json(toolPolicy as unknown as postgres.JSONValue)},
+          ${tx.json(context as unknown as postgres.JSONValue)}
+        )
+      `;
+
       const result: PreparedRun = {
         commandReceiptId: receipt.id,
         phase: receipt.orchestration_phase,
@@ -3016,24 +3005,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   }): Promise<RunRuntimeContext> {
     return this.sql.begin(async (tx) => {
       const run = await this.authorizeRun(tx, input.actor, input.runId);
-      if (run.external_session_ref === null || run.runtime_run_ref === null) {
-        throw new RunRuntimeContextUnavailableError();
-      }
       return {
         actor: input.actor,
         workflowId: run.workflow_id,
         sessionId: run.session_id,
         runId: run.run_id,
         status: run.status,
-        binding: {
-          canvasAgentBindingId: run.agent_binding_id,
-          agentId: run.agent_id,
-          runtimeKind: run.runtime_kind,
-          isolationKey: run.isolation_key,
-          ...(run.endpoint_ref === null ? {} : { endpointRef: run.endpoint_ref }),
-          ...(run.secret_ref === null ? {} : { secretRef: run.secret_ref }),
-        },
-        externalSessionRef: run.external_session_ref,
+        binding: parseRuntimeBindingSnapshot(run.runtime_binding_snapshot),
+        externalSessionRef: run.runtime_session_external_ref,
         externalRunRef: run.runtime_run_ref,
       };
     });
@@ -3063,6 +3042,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async markRuntimeSessionUnavailable(input: {
     actor: ActorContext;
     sessionId: string;
+    externalSessionRef: string;
     error: string;
   }): Promise<void> {
     await this.sql.begin(async (tx) => {
@@ -3074,6 +3054,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           updated_at = now()
         WHERE session_id = ${input.sessionId}
           AND is_primary = true AND status = 'active'
+          AND external_session_ref = ${input.externalSessionRef}
         RETURNING id
       `;
       if (!runtimeRef) {

@@ -16,7 +16,7 @@ import {
 
 import { accounts, agentBindings, agents } from './identity';
 import { messageRole, runStatus, runtimeKind } from './enums';
-import { sessions } from './workflows';
+import { sessionRuntimeRefs, sessions } from './workflows';
 
 export const modelCatalogEntries = pgTable(
   'model_catalog_entries',
@@ -154,6 +154,10 @@ export const runs = pgTable(
     idempotencyKey: text('idempotency_key').notNull(),
     status: runStatus('status').notNull().default('queued'),
     runtimeRunRef: text('runtime_run_ref'),
+    runtimeSessionRefId: uuid('runtime_session_ref_id').notNull(),
+    runtimeSessionExternalRef: text('runtime_session_external_ref').notNull(),
+    expectedHistoryDigest: text('expected_history_digest').notNull(),
+    runtimeBindingSnapshot: jsonb('runtime_binding_snapshot').notNull(),
     modelSnapshot: jsonb('model_snapshot').notNull(),
     toolPolicySnapshot: jsonb('tool_policy_snapshot').notNull(),
     contextPolicySnapshot: jsonb('context_policy_snapshot').notNull(),
@@ -169,6 +173,21 @@ export const runs = pgTable(
       table.idempotencyKey,
     ),
     unique('runs_session_id_unique').on(table.sessionId, table.id),
+    foreignKey({
+      name: 'runs_runtime_session_ref_fk',
+      columns: [
+        table.sessionId,
+        table.agentBindingId,
+        table.runtimeSessionRefId,
+        table.runtimeSessionExternalRef,
+      ],
+      foreignColumns: [
+        sessionRuntimeRefs.sessionId,
+        sessionRuntimeRefs.agentBindingId,
+        sessionRuntimeRefs.id,
+        sessionRuntimeRefs.externalSessionRef,
+      ],
+    }),
     foreignKey({
       name: 'runs_session_binding_fk',
       columns: [table.sessionId, table.agentBindingId],

@@ -2600,6 +2600,19 @@ describe('PostgresControlPlaneRepository', () => {
       LIMIT 1
     `;
     if (!config) throw new Error('Active Run race config fixture is missing');
+    const [runtimeRef] = await sql<{
+      id: string;
+      external_session_ref: string;
+      expected_history_digest: string;
+    }[]>`
+      SELECT id, external_session_ref,
+        metadata->>'historyDigest' AS expected_history_digest
+      FROM session_runtime_refs
+      WHERE session_id = ${session.sessionId}
+        AND agent_binding_id = ${fixture.agentBindingId}
+        AND is_primary = true AND status = 'active'
+    `;
+    if (!runtimeRef) throw new Error('Active Run race Runtime ref fixture is missing');
     await sql`
       INSERT INTO messages (
         id, workflow_id, session_id, ordinal, role,
@@ -2616,10 +2629,20 @@ describe('PostgresControlPlaneRepository', () => {
       INSERT INTO runs (
         id, session_id, agent_binding_id, config_revision_id,
         trigger_message_id, idempotency_key, status,
+        runtime_session_ref_id, runtime_session_external_ref,
+        expected_history_digest, runtime_binding_snapshot,
         model_snapshot, tool_policy_snapshot, context_policy_snapshot
       ) VALUES (
         ${dormantRunId}, ${session.sessionId}, ${fixture.agentBindingId}, ${config.id},
         ${dormantMessageId}, 'dormant-race-run', 'failed',
+        ${runtimeRef.id}, ${runtimeRef.external_session_ref},
+        ${runtimeRef.expected_history_digest},
+        ${sql.json({
+          canvasAgentBindingId: fixture.agentBindingId,
+          agentId: fixture.agentId,
+          runtimeKind: 'fake',
+          isolationKey: 'local-alpha',
+        })},
         ${sql.json({ providerKey: 'fake', modelKey: 'deterministic-v1' })},
         ${sql.json({
           allowedToolKeys: [],
@@ -3018,6 +3041,162 @@ describe('PostgresControlPlaneRepository', () => {
       ...input,
       commandId: nullPayloadCommandId,
     })).rejects.toThrow(/invalid persisted Run command result payload/i);
+  });
+
+  it('stores immutable Runtime Session identity and history digest on a prepared Run', async () => {
+    const suffix = 'immutable-runtime-input';
+    const {
+      session,
+      prepared,
+      externalSessionRef,
+    } = await prepareRuntimeRun({
+      suffix,
+      attachRun: false,
+    });
+
+    const [snapshot] = await sql<{
+      expected_history_digest: string;
+      runtime_binding_snapshot: Record<string, unknown>;
+      runtime_session_external_ref: string;
+      runtime_session_ref_id: string;
+      source_runtime_session_ref_id: string;
+    }[]>`
+      SELECT run.expected_history_digest,
+        run.runtime_binding_snapshot,
+        run.runtime_session_external_ref,
+        run.runtime_session_ref_id,
+        runtime_ref.id AS source_runtime_session_ref_id
+      FROM runs run
+      JOIN session_runtime_refs runtime_ref
+        ON runtime_ref.session_id = run.session_id
+       AND runtime_ref.external_session_ref = ${externalSessionRef}
+      WHERE run.id = ${prepared.runId}
+        AND run.session_id = ${session.sessionId}
+    `;
+
+    expect(snapshot).toMatchObject({
+      expected_history_digest: `history-${suffix}`,
+      runtime_binding_snapshot: prepared.runtime.binding,
+      runtime_session_external_ref: externalSessionRef,
+    });
+    expect(snapshot?.runtime_session_ref_id)
+      .toBe(snapshot?.source_runtime_session_ref_id);
+    expect(snapshot?.runtime_session_ref_id).toBeTruthy();
+
+    await expect(sql`
+      UPDATE runs
+      SET runtime_session_ref_id = ${'00000000-0000-4000-8000-000000000001'}
+      WHERE id = ${prepared.runId}
+    `).rejects.toThrow(/Run Runtime input snapshot is immutable/i);
+    await expect(sql`
+      UPDATE runs
+      SET runtime_session_external_ref = 'tampered-runtime-session-ref'
+      WHERE id = ${prepared.runId}
+    `).rejects.toThrow(/Run Runtime input snapshot is immutable/i);
+    await expect(sql`
+      UPDATE runs
+      SET expected_history_digest = 'tampered-history-digest'
+      WHERE id = ${prepared.runId}
+    `).rejects.toThrow(/Run Runtime input snapshot is immutable/i);
+    await expect(sql`
+      UPDATE runs
+      SET runtime_binding_snapshot = '{}'::jsonb
+      WHERE id = ${prepared.runId}
+    `).rejects.toThrow(/Run Runtime input snapshot is immutable/i);
+  });
+
+  it('replays a terminal Run from its immutable input after live history advances', async () => {
+    const suffix = 'immutable-terminal-replay';
+    const {
+      fixture,
+      session,
+      prepared,
+      externalSessionRef,
+    } = await prepareRuntimeRun({ suffix });
+    const input = {
+      actor: fixture.actor,
+      commandId: '71717171-1010-4010-8010-101010101010',
+      idempotencyKey: `run-${suffix}`,
+      sessionId: session.sessionId,
+      content: `Prompt ${suffix}`,
+    } as const;
+
+    await repository.ingestRuntimeEvent({
+      actor: fixture.actor,
+      runId: prepared.runId,
+      event: {
+        runtimeEventKey: 'immutable-terminal-completed',
+        eventType: 'run.completed',
+        payload: { status: 'succeeded' },
+        occurredAt: '2026-07-24T00:00:00.000Z',
+        terminal: { status: 'succeeded' },
+      },
+    });
+    await repository.syncRuntimeSessionHistory({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+      historyDigest: 'history-after-terminal-run',
+    });
+    await sql`
+      UPDATE agent_bindings SET isolation_key = 'rotated-after-terminal'
+      WHERE id = ${fixture.agentBindingId}
+    `;
+
+    await expect(repository.prepareRun({ ...input })).resolves.toMatchObject({
+      commandReceiptId: prepared.commandReceiptId,
+      phase: 'attached',
+      status: 'succeeded',
+      runtime: {
+        externalSessionRef,
+        expectedHistoryDigest: `history-${suffix}`,
+        binding: {
+          isolationKey: prepared.runtime.binding.isolationKey,
+        },
+      },
+    });
+  });
+
+  it('replays terminal failure after the snapshotted Runtime Session ref errors', async () => {
+    const suffix = 'immutable-session-not-found-replay';
+    const {
+      fixture,
+      session,
+      prepared,
+      externalSessionRef,
+    } = await prepareRuntimeRun({
+      suffix,
+      attachRun: false,
+    });
+    const input = {
+      actor: fixture.actor,
+      commandId: '71717171-1010-4010-8010-101010101010',
+      idempotencyKey: `run-${suffix}`,
+      sessionId: session.sessionId,
+      content: `Prompt ${suffix}`,
+    } as const;
+
+    await repository.markRuntimeSessionUnavailable({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+      externalSessionRef,
+      error: 'runtime_adapter:session_not_found:not-applied',
+    });
+    await repository.markRuntimeCommandFailure({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      retryable: false,
+      error: 'runtime_adapter:session_not_found:not-applied',
+    });
+
+    await expect(repository.prepareRun({ ...input })).resolves.toMatchObject({
+      commandReceiptId: prepared.commandReceiptId,
+      phase: 'terminal_failure',
+      status: 'failed',
+      runtime: {
+        externalSessionRef,
+        expectedHistoryDigest: `history-${suffix}`,
+      },
+    });
   });
 
   it('freezes server-selected model, tool, and authorized context snapshots', async () => {
@@ -3656,7 +3835,7 @@ describe('PostgresControlPlaneRepository', () => {
     ));
   });
 
-  it('requires complete Runtime refs, keeps Run attach idempotent, and authorizes viewer reads', async () => {
+  it('returns frozen Run context before attach, keeps attach idempotent, and authorizes viewer reads', async () => {
     const { fixture, prepared, externalRunRef, externalSessionRef } = await prepareRuntimeRun({
       suffix: 'runtime-context',
       attachRun: false,
@@ -3664,7 +3843,16 @@ describe('PostgresControlPlaneRepository', () => {
     await expect(repository.getRunRuntimeContext({
       actor: fixture.actor,
       runId: prepared.runId,
-    })).rejects.toThrow('Run Runtime context is incomplete');
+    })).resolves.toEqual({
+      actor: fixture.actor,
+      workflowId: fixture.workflowId,
+      sessionId: prepared.sessionId,
+      runId: prepared.runId,
+      status: 'queued',
+      binding: prepared.runtime.binding,
+      externalSessionRef,
+      externalRunRef: null,
+    });
 
     await repository.recordRuntimeResourceKnown({
       actor: fixture.actor,
@@ -3705,6 +3893,25 @@ describe('PostgresControlPlaneRepository', () => {
         ${viewerAccountId}, 'use', ${fixture.accountId}
       )
     `;
+    await expect(repository.getRunRuntimeContext({
+      actor: viewer,
+      runId: prepared.runId,
+    })).resolves.toEqual({
+      actor: viewer,
+      workflowId: fixture.workflowId,
+      sessionId: prepared.sessionId,
+      runId: prepared.runId,
+      status: 'running',
+      binding: prepared.runtime.binding,
+      externalSessionRef,
+      externalRunRef,
+    });
+    await repository.markRuntimeSessionUnavailable({
+      actor: fixture.actor,
+      sessionId: prepared.sessionId,
+      externalSessionRef,
+      error: 'runtime_adapter:session_not_found:not-applied',
+    });
     await expect(repository.getRunRuntimeContext({
       actor: viewer,
       runId: prepared.runId,
@@ -3905,6 +4112,19 @@ describe('PostgresControlPlaneRepository', () => {
     `;
     expect(synced?.history_digest).toBe('history-snapshot-updated');
 
+    await expect(repository.markRuntimeSessionUnavailable({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+      externalSessionRef: 'stale-session-ref',
+      error: 'stale-probe-result',
+    })).rejects.toThrow(/active primary Runtime reference/i);
+    await expect(repository.loadSessionSnapshot({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject({
+      runtimeRef: { externalSessionRef, status: 'active' },
+    });
+
     await repository.markRunReconciling({
       actor: fixture.actor,
       runId: prepared.runId,
@@ -3913,6 +4133,7 @@ describe('PostgresControlPlaneRepository', () => {
     await repository.markRuntimeSessionUnavailable({
       actor: fixture.actor,
       sessionId: session.sessionId,
+      externalSessionRef,
       error: 'runtime-offline',
     });
     await expect(repository.loadSessionSnapshot({
@@ -3964,6 +4185,7 @@ describe('PostgresControlPlaneRepository', () => {
     await expect(repository.markRuntimeSessionUnavailable({
       actor: viewer,
       sessionId: session.sessionId,
+      externalSessionRef,
       error: 'viewer-cannot-write',
     })).rejects.toThrow('Unauthorized control-plane operation');
   });
@@ -3975,11 +4197,15 @@ describe('PostgresControlPlaneRepository', () => {
       INSERT INTO runs (
         id, session_id, agent_binding_id, config_revision_id, trigger_message_id,
         idempotency_key, status, runtime_run_ref, model_snapshot,
-        tool_policy_snapshot, context_policy_snapshot, completed_at
+        tool_policy_snapshot, context_policy_snapshot, completed_at,
+        runtime_session_ref_id, runtime_session_external_ref,
+        expected_history_digest, runtime_binding_snapshot
       )
       SELECT ${terminalRunId}, session_id, agent_binding_id, config_revision_id,
         trigger_message_id, 'terminal-control', 'succeeded', 'terminal-runtime-ref',
-        model_snapshot, tool_policy_snapshot, context_policy_snapshot, now()
+        model_snapshot, tool_policy_snapshot, context_policy_snapshot, now(),
+        runtime_session_ref_id, runtime_session_external_ref,
+        expected_history_digest, runtime_binding_snapshot
       FROM runs WHERE id = ${prepared.runId}
     `;
 
@@ -4006,7 +4232,7 @@ describe('PostgresControlPlaneRepository', () => {
   });
 
   it('allows viewer reads while rejecting viewer and outsider Runtime state writes', async () => {
-    const { fixture, session, prepared } = await prepareRuntimeRun({
+    const { fixture, session, prepared, externalSessionRef } = await prepareRuntimeRun({
       suffix: 'runtime-authorization',
     });
     await repository.ingestRuntimeEvent({
@@ -4065,6 +4291,7 @@ describe('PostgresControlPlaneRepository', () => {
     await expect(repository.markRuntimeSessionUnavailable({
       actor: viewer,
       sessionId: session.sessionId,
+      externalSessionRef,
       error: 'viewer-write',
     })).rejects.toThrow('Unauthorized control-plane operation');
     await expect(repository.markRunReconciling({

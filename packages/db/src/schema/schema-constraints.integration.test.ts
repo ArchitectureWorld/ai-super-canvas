@@ -196,6 +196,9 @@ async function createRun(seed: Seed, sessionId: string): Promise<string> {
   const configRevisionId = randomUUID();
   const triggerMessageId = randomUUID();
   const runId = randomUUID();
+  const runtimeSessionRefId = randomUUID();
+  const runtimeSessionExternalRef = `runtime-session:${runId}`;
+  const expectedHistoryDigest = `history:${runId}`;
   await sql.begin(async (tx) => {
     await tx`
       INSERT INTO session_config_revisions (
@@ -211,13 +214,33 @@ async function createRun(seed: Seed, sessionId: string): Promise<string> {
       )
     `;
     await tx`
+      INSERT INTO session_runtime_refs (
+        id, session_id, agent_binding_id, external_session_ref,
+        runtime_version, is_primary, status, metadata
+      ) VALUES (
+        ${runtimeSessionRefId}, ${sessionId}, ${seed.agentBindingId},
+        ${runtimeSessionExternalRef}, 'test-runtime-v1', true, 'active',
+        ${tx.json({ historyDigest: expectedHistoryDigest })}
+      )
+    `;
+    await tx`
       INSERT INTO runs (
         id, session_id, agent_binding_id, config_revision_id, trigger_message_id,
         idempotency_key, status, model_snapshot, tool_policy_snapshot,
-        context_policy_snapshot
+        context_policy_snapshot, runtime_session_ref_id,
+        runtime_session_external_ref, expected_history_digest,
+        runtime_binding_snapshot
       ) VALUES (
         ${runId}, ${sessionId}, ${seed.agentBindingId}, ${configRevisionId},
-        ${triggerMessageId}, ${`run:${runId}`}, 'queued', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb
+        ${triggerMessageId}, ${`run:${runId}`}, 'queued',
+        '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+        ${runtimeSessionRefId}, ${runtimeSessionExternalRef},
+        ${expectedHistoryDigest}, ${tx.json({
+          canvasAgentBindingId: seed.agentBindingId,
+          agentId: seed.agentId,
+          runtimeKind: 'fake',
+          isolationKey: `isolation:${seed.agentBindingId}`,
+        })}
       )
     `;
   });
@@ -1184,6 +1207,9 @@ describe('S1 PostgreSQL schema invariants', () => {
     const triggerMessageId = randomUUID();
     const runId = randomUUID();
     const commandReceiptId = randomUUID();
+    const runtimeSessionRefId = randomUUID();
+    const runtimeSessionExternalRef = `runtime-session:${runId}`;
+    const expectedHistoryDigest = `history:${runId}`;
     const secondSessionId = await createSession(second);
     const lookupMetadata = sql.json({
       commandId: commandReceiptId,
@@ -1204,13 +1230,33 @@ describe('S1 PostgreSQL schema invariants', () => {
       )
     `;
     await sql`
+      INSERT INTO session_runtime_refs (
+        id, session_id, agent_binding_id, external_session_ref,
+        runtime_version, is_primary, status, metadata
+      ) VALUES (
+        ${runtimeSessionRefId}, ${sessionId}, ${first.agentBindingId},
+        ${runtimeSessionExternalRef}, 'test-runtime-v1', true, 'active',
+        ${sql.json({ historyDigest: expectedHistoryDigest })}
+      )
+    `;
+    await sql`
       INSERT INTO runs (
         id, session_id, agent_binding_id, config_revision_id, trigger_message_id,
         idempotency_key, status, model_snapshot, tool_policy_snapshot,
-        context_policy_snapshot
+        context_policy_snapshot, runtime_session_ref_id,
+        runtime_session_external_ref, expected_history_digest,
+        runtime_binding_snapshot
       ) VALUES (
         ${runId}, ${sessionId}, ${first.agentBindingId}, ${configRevisionId},
-        ${triggerMessageId}, 'run-1', 'queued', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb
+        ${triggerMessageId}, 'run-1', 'queued',
+        '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+        ${runtimeSessionRefId}, ${runtimeSessionExternalRef},
+        ${expectedHistoryDigest}, ${sql.json({
+          canvasAgentBindingId: first.agentBindingId,
+          agentId: first.agentId,
+          runtimeKind: 'fake',
+          isolationKey: `isolation:${first.agentBindingId}`,
+        })}
       )
     `;
     await sql`
@@ -1513,5 +1559,62 @@ describe('S1 PostgreSQL schema invariants', () => {
     for (const indexName of expectedIndexes) {
       expect(serializedPlan).toContain(indexName);
     }
+  });
+
+  it('installs immutable Runtime input columns and the Run-to-ref foreign key', async () => {
+    const columns = await sql<{
+      column_name: string;
+      is_nullable: string;
+    }[]>`
+      SELECT column_name, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'runs'
+        AND column_name IN (
+          'expected_history_digest',
+          'runtime_binding_snapshot',
+          'runtime_session_external_ref',
+          'runtime_session_ref_id'
+        )
+      ORDER BY column_name
+    `;
+    expect(columns).toEqual([
+      {
+        column_name: 'expected_history_digest',
+        is_nullable: 'NO',
+      },
+      {
+        column_name: 'runtime_binding_snapshot',
+        is_nullable: 'NO',
+      },
+      {
+        column_name: 'runtime_session_external_ref',
+        is_nullable: 'NO',
+      },
+      {
+        column_name: 'runtime_session_ref_id',
+        is_nullable: 'NO',
+      },
+    ]);
+
+    const foreignKeys = await sql<{ conname: string }[]>`
+      SELECT conname
+      FROM pg_constraint
+      WHERE conrelid = 'runs'::regclass
+        AND contype = 'f'
+      ORDER BY conname
+    `;
+    expect(foreignKeys.map((foreignKey) => foreignKey.conname))
+      .toContain('runs_runtime_session_ref_fk');
+
+    const triggers = await sql<{ tgname: string }[]>`
+      SELECT tgname
+      FROM pg_trigger
+      WHERE tgrelid = 'runs'::regclass
+        AND NOT tgisinternal
+      ORDER BY tgname
+    `;
+    expect(triggers.map((trigger) => trigger.tgname))
+      .toContain('protect_run_runtime_input_snapshot_trigger');
   });
 });

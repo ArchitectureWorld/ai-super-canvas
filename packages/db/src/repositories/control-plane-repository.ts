@@ -347,6 +347,7 @@ export interface ControlPlaneRepository {
   markRuntimeSessionUnavailable(input: {
     actor: ActorContext;
     sessionId: string;
+    externalSessionRef: string;
     error: string;
   }): Promise<void>;
   markRunReconciling(input: {

@@ -104,6 +104,19 @@ describe('control-plane schema exports', () => {
     expect(compensationColumns).toHaveProperty('resolvedAt');
   });
 
+  it('declares immutable Runtime input snapshots on Runs', () => {
+    const runColumns = getTableColumns(runs);
+    const foreignKeyNames = getTableConfig(runs)
+      .foreignKeys
+      .map((foreignKey) => foreignKey.getName());
+
+    expect(runColumns).toHaveProperty('runtimeSessionRefId');
+    expect(runColumns).toHaveProperty('runtimeBindingSnapshot');
+    expect(runColumns).toHaveProperty('runtimeSessionExternalRef');
+    expect(runColumns).toHaveProperty('expectedHistoryDigest');
+    expect(foreignKeyNames).toContain('runs_runtime_session_ref_fk');
+  });
+
   it('uses explicit PostgreSQL-safe names for SessionConfigRevision foreign keys', () => {
     const foreignKeyNames = getTableConfig(sessionConfigRevisions)
       .foreignKeys

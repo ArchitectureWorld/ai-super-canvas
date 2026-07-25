@@ -14,6 +14,10 @@
 - 计划编写基线：`main` 的 `2a06bff4a2ed10e6fde7e746313cbea069b9a53a`；执行前必须重新 fetch，并从最新 `origin/main` 建立新的隔离 worktree。
 - 本计划只交付设计规格第 12 节的 **Application PR**；不修改 `apps/web`、Route Handler、`/control-plane-test`、Hermes、现有 `/` 画布或 World Canvas。
 - application package 只依赖 `@ai-super-canvas/core`、`@ai-super-canvas/ai`、`@ai-super-canvas/db`；禁止依赖 React、Next.js、`postgres` 或 Drizzle。
+- **审查后范围修订：** Tasks 5–6 的并发与重启审查证明 Run replay
+  必须拥有不可变的 Runtime dispatch authority。Application PR 因此同时交付
+  migration `0007_motionless_black_queen.sql` 及其最小 Repository/schema
+  加固；部署本 PR 必须先应用 0007。`packages/control-plane` 仍不直接执行 SQL。
 - 所有 Runtime dispatch 先取得 Repository dispatch lease；所有 external ref 先 `recordRuntimeResourceKnown`，再 attach。
 - `RuntimeAdapterError.operationEffect === "not-applied"` 才能进入失败/可重试路径；其他 Runtime 结果一律进入 reconciliation，禁止盲目再次 dispatch。
 - `RunEventPump` 只提供单进程互斥，不宣称多副本安全；多副本 lease/worker 不属于本 PR。
@@ -2505,8 +2509,16 @@ Expected: event DTOs omit event keys and explicit external refs; transcript surv
 
 ### Task 7: Close the package boundary and run the Application PR gate
 
+**Approved scope amendment:** the required immutable Run-authority migration and
+Repository/schema hardening discovered by Tasks 5–6 review are part of this PR
+and are a mandatory rollout prerequisite. This does not permit API, page, or
+browser changes, and does not move SQL into the application package.
+
 **Files:**
-- Modify only if checks require a scoped correction:
+- Modify to record the approved scope amendment:
+  - `docs/superpowers/plans/2026-07-23-server-persisted-session-application-layer.md`
+  - `docs/superpowers/specs/2026-07-23-server-persisted-session-vertical-slice-design.md`
+- Modify production files only if checks require a scoped correction:
   - `packages/control-plane/src/*.ts`
   - `packages/control-plane/package.json`
   - `pnpm-lock.yaml`
@@ -2514,7 +2526,8 @@ Expected: event DTOs omit event keys and explicit external refs; transcript surv
 
 **Interfaces:**
 - Consumes: all preceding task outputs.
-- Produces: a review-ready Application PR with no API, page or database changes.
+- Produces: a review-ready Application PR with no API or page changes, plus the
+  mandatory migration 0007 rollout prerequisite.
 
 - [ ] **Step 1: Verify the public export boundary**
 
@@ -2589,7 +2602,10 @@ git diff --name-status origin/main...HEAD
 git log --oneline origin/main..HEAD
 ```
 
-Expected: branch is based on current `origin/main`; diff contains `packages/control-plane`, `Dockerfile`, and `pnpm-lock.yaml` only; commits correspond to Tasks 1–6.
+Expected: branch is based on current `origin/main`; diff contains
+`packages/control-plane`, `Dockerfile`, `pnpm-lock.yaml`, migration 0007, and
+only the Repository/schema/tests needed to enforce immutable Run dispatch
+authority. It contains no API or page changes; commits correspond to Tasks 1–7.
 
 - [ ] **Step 5: Push and open the Application PR**
 
@@ -2609,7 +2625,8 @@ and this exact content:
 - records external refs before attach
 - separates `not-applied` failures from unknown effects that require reconciliation
 - keeps ActorContext, model and tool policy server-owned
-- does not add Next.js routes, browser UI, Hermes, SQL or multi-replica claims
+- keeps SQL out of `packages/control-plane` and adds no Next.js routes, browser UI, Hermes or multi-replica claims
+- ships migration 0007 as a mandatory prerequisite so every Run owns immutable Runtime dispatch authority
 
 ## Validation
 
@@ -2648,7 +2665,8 @@ Expected: Quality, Integration and CodeQL are green before changing the PR from 
 
 | Approved requirement | Implemented by |
 | --- | --- |
-| `packages/control-plane` only; no React/Next/SQL | Tasks 1–7 |
+| application code stays in `packages/control-plane`; no React/Next/direct SQL | Tasks 1–7 |
+| migration 0007 freezes Run dispatch authority before application rollout | Tasks 5–7 |
 | server-owned Fake model and policy | Task 4 |
 | root Session dispatch exactly once | Task 4 |
 | external ref recorded before attach | Tasks 4–5 |

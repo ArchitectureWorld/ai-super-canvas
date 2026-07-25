@@ -257,7 +257,10 @@ V0.1 事件接口读取 PostgreSQL 中已经持久化的事件，不直接消费
 每个完成项都通过独立 PR 交付，不直接写 main：
 
 1. **设计 PR（本文件）**：确认范围、边界和验收；
-2. **Application PR**：新增 `packages/control-plane`、SessionService、RunEventPump 和单元测试；
+2. **Application PR**：新增 `packages/control-plane`、SessionService、
+   RunEventPump 和单元测试；并包含审查后批准的 migration 0007 与最小
+   Repository/schema 加固，作为不可变 Run dispatch authority 的强制部署
+   前置。application package 本身仍不直接执行 SQL；
 3. **API PR**：新增 server composition、Route Handlers、readiness 和 Route 合约测试；
 4. **Test Page PR**：新增 `/control-plane-test`、客户端状态机和页面测试；
 5. **Golden Path PR**：补齐数据库支持的完整纵切、浏览器 E2E、重启语义和执行证据文档。
