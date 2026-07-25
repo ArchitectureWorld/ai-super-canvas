@@ -39,7 +39,6 @@ import {
   ActiveRunConflictError,
   RunIdempotencyConflictError,
   RuntimeEventConflictError,
-  RunRuntimeContextUnavailableError,
   RunStateConflictError,
   type PersistableRunEvent,
   type PreparedRun,
@@ -185,7 +184,8 @@ interface AuthorizedRunRow extends AuthorizationRow {
   session_id: string;
   status: StoredRunStatus;
   runtime_run_ref: string | null;
-  external_session_ref: string | null;
+  runtime_session_external_ref: string;
+  runtime_binding_snapshot: unknown;
 }
 
 interface StoredRunEventRow {
@@ -1047,7 +1047,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
             binding.runtime_kind::text AS runtime_kind, binding.isolation_key,
             binding.endpoint_ref, binding.secret_ref,
             run.id AS run_id, run.session_id, run.status::text AS status,
-            run.runtime_run_ref, runtime_ref.external_session_ref
+            run.runtime_run_ref, run.runtime_session_external_ref,
+            run.runtime_binding_snapshot
           FROM runs run
           JOIN sessions session ON session.id = run.session_id
           JOIN workflows workflow ON workflow.id = session.workflow_id
@@ -1059,10 +1060,6 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
            AND member.account_id = account.id
           JOIN agent_bindings binding ON binding.id = run.agent_binding_id
           JOIN agents agent ON agent.id = binding.agent_id AND agent.status = 'active'
-          LEFT JOIN session_runtime_refs runtime_ref
-            ON runtime_ref.session_id = session.id
-           AND runtime_ref.is_primary = true
-           AND runtime_ref.status = 'active'
           WHERE run.id = ${runId}
             AND member.role = ANY(${allowedRoles})
             AND binding.status IN ('ready', 'degraded')
@@ -1083,7 +1080,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
             binding.runtime_kind::text AS runtime_kind, binding.isolation_key,
             binding.endpoint_ref, binding.secret_ref,
             run.id AS run_id, run.session_id, run.status::text AS status,
-            run.runtime_run_ref, runtime_ref.external_session_ref
+            run.runtime_run_ref, run.runtime_session_external_ref,
+            run.runtime_binding_snapshot
           FROM runs run
           JOIN sessions session ON session.id = run.session_id
           JOIN workflows workflow ON workflow.id = session.workflow_id
@@ -1095,10 +1093,6 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
            AND member.account_id = account.id
           JOIN agent_bindings binding ON binding.id = run.agent_binding_id
           JOIN agents agent ON agent.id = binding.agent_id AND agent.status = 'active'
-          LEFT JOIN session_runtime_refs runtime_ref
-            ON runtime_ref.session_id = session.id
-           AND runtime_ref.is_primary = true
-           AND runtime_ref.status = 'active'
           WHERE run.id = ${runId}
             AND member.role = ANY(${allowedRoles})
             AND binding.status IN ('ready', 'degraded')
@@ -3011,24 +3005,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   }): Promise<RunRuntimeContext> {
     return this.sql.begin(async (tx) => {
       const run = await this.authorizeRun(tx, input.actor, input.runId);
-      if (run.external_session_ref === null || run.runtime_run_ref === null) {
-        throw new RunRuntimeContextUnavailableError();
-      }
       return {
         actor: input.actor,
         workflowId: run.workflow_id,
         sessionId: run.session_id,
         runId: run.run_id,
         status: run.status,
-        binding: {
-          canvasAgentBindingId: run.agent_binding_id,
-          agentId: run.agent_id,
-          runtimeKind: run.runtime_kind,
-          isolationKey: run.isolation_key,
-          ...(run.endpoint_ref === null ? {} : { endpointRef: run.endpoint_ref }),
-          ...(run.secret_ref === null ? {} : { secretRef: run.secret_ref }),
-        },
-        externalSessionRef: run.external_session_ref,
+        binding: parseRuntimeBindingSnapshot(run.runtime_binding_snapshot),
+        externalSessionRef: run.runtime_session_external_ref,
         externalRunRef: run.runtime_run_ref,
       };
     });
@@ -3058,6 +3042,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async markRuntimeSessionUnavailable(input: {
     actor: ActorContext;
     sessionId: string;
+    externalSessionRef: string;
     error: string;
   }): Promise<void> {
     await this.sql.begin(async (tx) => {
@@ -3069,6 +3054,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           updated_at = now()
         WHERE session_id = ${input.sessionId}
           AND is_primary = true AND status = 'active'
+          AND external_session_ref = ${input.externalSessionRef}
         RETURNING id
       `;
       if (!runtimeRef) {

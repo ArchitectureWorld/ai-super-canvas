@@ -3178,6 +3178,7 @@ describe('PostgresControlPlaneRepository', () => {
     await repository.markRuntimeSessionUnavailable({
       actor: fixture.actor,
       sessionId: session.sessionId,
+      externalSessionRef,
       error: 'runtime_adapter:session_not_found:not-applied',
     });
     await repository.markRuntimeCommandFailure({
@@ -3834,7 +3835,7 @@ describe('PostgresControlPlaneRepository', () => {
     ));
   });
 
-  it('requires complete Runtime refs, keeps Run attach idempotent, and authorizes viewer reads', async () => {
+  it('returns frozen Run context before attach, keeps attach idempotent, and authorizes viewer reads', async () => {
     const { fixture, prepared, externalRunRef, externalSessionRef } = await prepareRuntimeRun({
       suffix: 'runtime-context',
       attachRun: false,
@@ -3842,7 +3843,16 @@ describe('PostgresControlPlaneRepository', () => {
     await expect(repository.getRunRuntimeContext({
       actor: fixture.actor,
       runId: prepared.runId,
-    })).rejects.toThrow('Run Runtime context is incomplete');
+    })).resolves.toEqual({
+      actor: fixture.actor,
+      workflowId: fixture.workflowId,
+      sessionId: prepared.sessionId,
+      runId: prepared.runId,
+      status: 'queued',
+      binding: prepared.runtime.binding,
+      externalSessionRef,
+      externalRunRef: null,
+    });
 
     await repository.recordRuntimeResourceKnown({
       actor: fixture.actor,
@@ -3883,6 +3893,25 @@ describe('PostgresControlPlaneRepository', () => {
         ${viewerAccountId}, 'use', ${fixture.accountId}
       )
     `;
+    await expect(repository.getRunRuntimeContext({
+      actor: viewer,
+      runId: prepared.runId,
+    })).resolves.toEqual({
+      actor: viewer,
+      workflowId: fixture.workflowId,
+      sessionId: prepared.sessionId,
+      runId: prepared.runId,
+      status: 'running',
+      binding: prepared.runtime.binding,
+      externalSessionRef,
+      externalRunRef,
+    });
+    await repository.markRuntimeSessionUnavailable({
+      actor: fixture.actor,
+      sessionId: prepared.sessionId,
+      externalSessionRef,
+      error: 'runtime_adapter:session_not_found:not-applied',
+    });
     await expect(repository.getRunRuntimeContext({
       actor: viewer,
       runId: prepared.runId,
@@ -4083,6 +4112,19 @@ describe('PostgresControlPlaneRepository', () => {
     `;
     expect(synced?.history_digest).toBe('history-snapshot-updated');
 
+    await expect(repository.markRuntimeSessionUnavailable({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+      externalSessionRef: 'stale-session-ref',
+      error: 'stale-probe-result',
+    })).rejects.toThrow(/active primary Runtime reference/i);
+    await expect(repository.loadSessionSnapshot({
+      actor: fixture.actor,
+      sessionId: session.sessionId,
+    })).resolves.toMatchObject({
+      runtimeRef: { externalSessionRef, status: 'active' },
+    });
+
     await repository.markRunReconciling({
       actor: fixture.actor,
       runId: prepared.runId,
@@ -4091,6 +4133,7 @@ describe('PostgresControlPlaneRepository', () => {
     await repository.markRuntimeSessionUnavailable({
       actor: fixture.actor,
       sessionId: session.sessionId,
+      externalSessionRef,
       error: 'runtime-offline',
     });
     await expect(repository.loadSessionSnapshot({
@@ -4142,6 +4185,7 @@ describe('PostgresControlPlaneRepository', () => {
     await expect(repository.markRuntimeSessionUnavailable({
       actor: viewer,
       sessionId: session.sessionId,
+      externalSessionRef,
       error: 'viewer-cannot-write',
     })).rejects.toThrow('Unauthorized control-plane operation');
   });
@@ -4188,7 +4232,7 @@ describe('PostgresControlPlaneRepository', () => {
   });
 
   it('allows viewer reads while rejecting viewer and outsider Runtime state writes', async () => {
-    const { fixture, session, prepared } = await prepareRuntimeRun({
+    const { fixture, session, prepared, externalSessionRef } = await prepareRuntimeRun({
       suffix: 'runtime-authorization',
     });
     await repository.ingestRuntimeEvent({
@@ -4247,6 +4291,7 @@ describe('PostgresControlPlaneRepository', () => {
     await expect(repository.markRuntimeSessionUnavailable({
       actor: viewer,
       sessionId: session.sessionId,
+      externalSessionRef,
       error: 'viewer-write',
     })).rejects.toThrow('Unauthorized control-plane operation');
     await expect(repository.markRunReconciling({

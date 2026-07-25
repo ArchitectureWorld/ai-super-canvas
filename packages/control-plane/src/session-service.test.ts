@@ -893,6 +893,7 @@ describe('SessionService Run start', () => {
     expect(repository.markRuntimeSessionUnavailable).toHaveBeenCalledWith({
       actor,
       sessionId: ids.sessionId,
+      externalSessionRef: 'fake-session-1',
       error: 'runtime_adapter:session_not_found:not-applied',
     });
     expect(repository.markRuntimeCommandFailure).toHaveBeenCalledWith({
@@ -1367,5 +1368,613 @@ describe('SessionService Run start', () => {
     });
     expect(runtime.startRun).not.toHaveBeenCalled();
     expect(eventPump.start).toHaveBeenCalledOnce();
+  });
+});
+
+describe('SessionService persisted reads', () => {
+  const runId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const occurredAt = new Date(0).toISOString();
+  const sessionSnapshot = {
+    sessionId: ids.sessionId,
+    status: 'active',
+    messages: [{
+      id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+      sessionId: ids.sessionId,
+      runId: null,
+      ordinal: 0,
+      role: 'user' as const,
+      content: {
+        text: 'say fake',
+        nested: {
+          externalRunRef: 'fake-run-content-private',
+          runtimeEventKey: 'runtime-event-content-private',
+          secretRef: 'secret-ref-content-private',
+          keep: 'public-content',
+        },
+      },
+      status: 'completed',
+      externalMessageRef: 'external-message-private',
+      sourceRuntimeEventKey: 'runtime-event-private',
+    }],
+    activeRun: null,
+    runtimeRef: {
+      externalSessionRef: 'fake-session-1',
+      status: 'active' as const,
+    },
+  };
+
+  it('reads Run status before events and strips Runtime refs, keys, and raw failures', async () => {
+    const repository = {
+      getRunRuntimeContext: vi.fn().mockResolvedValue({
+        actor,
+        workflowId: ids.workflowId,
+        sessionId: ids.sessionId,
+        runId,
+        status: 'failed',
+        binding: preparedRun().runtime.binding,
+        externalSessionRef: 'fake-session-1',
+        externalRunRef: 'fake-run-private',
+      }),
+      listRunEvents: vi.fn().mockResolvedValue([{
+        runId,
+        sequence: 6,
+        eventType: 'run.failed',
+        payload: {
+          eventId: 'runtime-event-private',
+          type: 'run.failed',
+          canvasSessionId: ids.sessionId,
+          canvasRunId: runId,
+          externalEventRef: 'external-event-private',
+          externalRunRef: 'fake-run-private',
+          externalMessageRef: 'external-message-private',
+          secretRef: 'secret-ref-private',
+          occurredAt,
+          code: 'internal_error',
+          message: 'postgres://secret@internal/runtime-ref-private/root',
+          retryable: true,
+          details: {
+            externalSessionRef: 'fake-session-private',
+            message: 'postgres://secret@internal/runtime-ref-private/nested',
+            keep: 'private-detail',
+          },
+          errorMessage: 'postgres://secret@internal/runtime-ref-private/error',
+          stack: 'postgres://secret@internal/runtime-ref-private/stack',
+          cause: {
+            message: 'postgres://secret@internal/runtime-ref-private/cause',
+          },
+        },
+        externalEventRef: 'external-event-private',
+        runtimeEventKey: 'runtime-event-private',
+        occurredAt,
+      }]),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      {} as RuntimeAdapter,
+      pump,
+    );
+
+    const result = await service.getRunEvents({
+      actor,
+      runId,
+      after: 5,
+    });
+
+    expect(result).toEqual({
+      events: [{
+        sequence: 6,
+        eventType: 'run.failed',
+        payload: {
+          type: 'run.failed',
+          canvasSessionId: ids.sessionId,
+          canvasRunId: runId,
+          occurredAt,
+          code: 'internal_error',
+          retryable: true,
+        },
+        occurredAt,
+      }],
+      nextAfter: 6,
+      terminal: { status: 'failed' },
+    });
+    expect(
+      repository.getRunRuntimeContext.mock.invocationCallOrder[0],
+    ).toBeLessThan(repository.listRunEvents.mock.invocationCallOrder[0]!);
+    expect(JSON.stringify(result)).not.toMatch(
+      /external|runtime-event-private|secret-ref-private|postgres:\/\/|private-detail/,
+    );
+  });
+
+  it('keeps the cursor and reports no terminal state for an empty active page', async () => {
+    const repository = {
+      getRunRuntimeContext: vi.fn().mockResolvedValue({
+        actor,
+        workflowId: ids.workflowId,
+        sessionId: ids.sessionId,
+        runId,
+        status: 'running',
+        binding: preparedRun().runtime.binding,
+        externalSessionRef: 'fake-session-1',
+        externalRunRef: 'fake-run-1',
+      }),
+      listRunEvents: vi.fn().mockResolvedValue([]),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      {} as RuntimeAdapter,
+      pump,
+    );
+
+    await expect(service.getRunEvents({
+      actor,
+      runId,
+      after: 17,
+      limit: 25,
+    })).resolves.toEqual({
+      events: [],
+      nextAfter: 17,
+      terminal: null,
+    });
+    expect(repository.listRunEvents).toHaveBeenCalledWith({
+      actor,
+      runId,
+      after: 17,
+      limit: 25,
+    });
+  });
+
+  it('does not report a terminal Run while later persisted events remain unread', async () => {
+    const repository = {
+      getRunRuntimeContext: vi.fn().mockResolvedValue({
+        actor,
+        workflowId: ids.workflowId,
+        sessionId: ids.sessionId,
+        runId,
+        status: 'succeeded',
+        binding: preparedRun().runtime.binding,
+        externalSessionRef: 'fake-session-1',
+        externalRunRef: 'fake-run-1',
+      }),
+      listRunEvents: vi.fn()
+        .mockResolvedValueOnce([{
+          runId,
+          sequence: 6,
+          eventType: 'model.output.delta',
+          payload: { type: 'model.output.delta', text: 'partial' },
+          externalEventRef: null,
+          runtimeEventKey: 'event-6',
+          occurredAt,
+        }])
+        .mockResolvedValueOnce([{
+          runId,
+          sequence: 7,
+          eventType: 'run.completed',
+          payload: { type: 'run.completed' },
+          externalEventRef: null,
+          runtimeEventKey: 'event-7',
+          occurredAt,
+        }]),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      {} as RuntimeAdapter,
+      pump,
+    );
+
+    await expect(service.getRunEvents({
+      actor,
+      runId,
+      after: 5,
+      limit: 1,
+    })).resolves.toEqual({
+      events: [{
+        sequence: 6,
+        eventType: 'model.output.delta',
+        payload: { type: 'model.output.delta', text: 'partial' },
+        occurredAt,
+      }],
+      nextAfter: 6,
+      terminal: null,
+    });
+    expect(repository.listRunEvents).toHaveBeenNthCalledWith(2, {
+      actor,
+      runId,
+      after: 6,
+      limit: 1,
+    });
+  });
+
+  it('returns opaque transcript content without exposing stored Runtime metadata', async () => {
+    const repository = {
+      loadSessionSnapshot: vi.fn().mockResolvedValue(sessionSnapshot),
+      getSessionRuntimeContext: vi.fn().mockResolvedValue({
+        ...sessionContext(),
+        status: 'active',
+        externalSessionRef: 'fake-session-1',
+        expectedHistoryDigest: 'sha256:before-run',
+        binding: {
+          ...sessionContext().binding,
+          secretRef: 'vault://runtime-binding-private',
+        },
+      }),
+      markRuntimeSessionUnavailable: vi.fn(),
+    };
+    const runtime = {
+      loadSession: vi.fn().mockResolvedValue({
+        externalSessionRef: 'fake-session-1',
+        runtimeVersion: '1',
+        replayStatus: 'complete',
+        historyDigest: 'sha256:before-run',
+        metadata: {},
+      }),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+
+    const result = await service.getSessionTranscript({
+      actor,
+      sessionId: ids.sessionId,
+    });
+
+    expect(result).toEqual({
+      sessionId: ids.sessionId,
+      status: 'active',
+      messages: [{
+        messageId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+        runId: null,
+        ordinal: 0,
+        role: 'user',
+        content: {
+          text: 'say fake',
+          nested: {
+            externalRunRef: 'fake-run-content-private',
+            runtimeEventKey: 'runtime-event-content-private',
+            secretRef: 'secret-ref-content-private',
+            keep: 'public-content',
+          },
+        },
+        status: 'completed',
+      }],
+      activeRun: null,
+      reconciliationState: null,
+      runtimeAvailability: 'available',
+    });
+    expect(JSON.stringify(result)).not.toMatch(
+      /fake-session-1|external-message-private|runtime-event-private|vault:\/\//,
+    );
+  });
+
+  it('returns persisted history as unavailable without probing an inactive ref', async () => {
+    const repository = {
+      loadSessionSnapshot: vi.fn().mockResolvedValue({
+        ...sessionSnapshot,
+        activeRun: { runId, status: 'reconciling' as const },
+        runtimeRef: {
+          externalSessionRef: 'fake-session-1',
+          status: 'error' as const,
+        },
+      }),
+      getSessionRuntimeContext: vi.fn(),
+      markRuntimeSessionUnavailable: vi.fn(),
+    };
+    const runtime = { loadSession: vi.fn() };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+
+    await expect(service.getSessionTranscript({
+      actor,
+      sessionId: ids.sessionId,
+    })).resolves.toMatchObject({
+      activeRun: { runId, status: 'reconciling' },
+      reconciliationState: {
+        kind: 'run-reconciling',
+        message: 'Run requires reconciliation',
+      },
+      runtimeAvailability: 'unavailable',
+    });
+    expect(repository.getSessionRuntimeContext).not.toHaveBeenCalled();
+    expect(runtime.loadSession).not.toHaveBeenCalled();
+  });
+
+  it('marks a definitively missing Runtime Session unavailable with a safe category', async () => {
+    const unavailableSnapshot = {
+      ...sessionSnapshot,
+      runtimeRef: {
+        externalSessionRef: 'fake-session-1',
+        status: 'error' as const,
+      },
+    };
+    const repository = {
+      loadSessionSnapshot: vi.fn()
+        .mockResolvedValueOnce(sessionSnapshot)
+        .mockResolvedValueOnce(unavailableSnapshot),
+      getSessionRuntimeContext: vi.fn().mockResolvedValue({
+        ...sessionContext(),
+        status: 'active',
+        externalSessionRef: 'fake-session-1',
+      }),
+      markRuntimeSessionUnavailable: vi.fn().mockResolvedValue(undefined),
+    };
+    const sentinel = 'postgres://secret@internal/runtime-ref-private';
+    const runtime = {
+      loadSession: vi.fn().mockRejectedValue(new RuntimeAdapterError(
+        'session_not_found',
+        sentinel,
+        false,
+        'not-applied',
+      )),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+
+    const result = await service.getSessionTranscript({
+      actor,
+      sessionId: ids.sessionId,
+    });
+
+    expect(result).toMatchObject({
+      runtimeAvailability: 'unavailable',
+      reconciliationState: {
+        kind: 'runtime-unavailable',
+      },
+    });
+    expect(repository.markRuntimeSessionUnavailable).toHaveBeenCalledWith({
+      actor,
+      sessionId: ids.sessionId,
+      externalSessionRef: 'fake-session-1',
+      error: 'runtime_adapter:session_not_found:not-applied',
+    });
+    expect(JSON.stringify({
+      result,
+      calls: repository.markRuntimeSessionUnavailable.mock.calls,
+    })).not.toContain(sentinel);
+  });
+
+  it('accepts a concurrent unavailable mark only after observing its persisted snapshot', async () => {
+    const unavailableSnapshot = {
+      ...sessionSnapshot,
+      runtimeRef: {
+        externalSessionRef: 'fake-session-1',
+        status: 'error' as const,
+      },
+    };
+    const repository = {
+      loadSessionSnapshot: vi.fn()
+        .mockResolvedValueOnce(sessionSnapshot)
+        .mockResolvedValueOnce(unavailableSnapshot),
+      getSessionRuntimeContext: vi.fn().mockResolvedValue({
+        ...sessionContext(),
+        status: 'active',
+        externalSessionRef: 'fake-session-1',
+      }),
+      markRuntimeSessionUnavailable: vi.fn().mockRejectedValue(
+        new Error('active ref already changed'),
+      ),
+    };
+    const runtime = {
+      loadSession: vi.fn().mockRejectedValue(new RuntimeAdapterError(
+        'session_not_found',
+        'missing',
+        false,
+        'not-applied',
+      )),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+
+    await expect(service.getSessionTranscript({
+      actor,
+      sessionId: ids.sessionId,
+    })).resolves.toMatchObject({
+      runtimeAvailability: 'unavailable',
+    });
+    expect(repository.loadSessionSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('re-probes a concurrently rotated active Runtime Session ref', async () => {
+    const rotatedSnapshot = {
+      ...sessionSnapshot,
+      runtimeRef: {
+        externalSessionRef: 'fake-session-2',
+        status: 'active' as const,
+      },
+    };
+    const repository = {
+      loadSessionSnapshot: vi.fn()
+        .mockResolvedValueOnce(sessionSnapshot)
+        .mockResolvedValueOnce(rotatedSnapshot),
+      getSessionRuntimeContext: vi.fn()
+        .mockResolvedValueOnce({
+          ...sessionContext(),
+          status: 'active',
+          externalSessionRef: 'fake-session-1',
+        })
+        .mockResolvedValueOnce({
+          ...sessionContext(),
+          status: 'active',
+          externalSessionRef: 'fake-session-2',
+        }),
+      markRuntimeSessionUnavailable: vi.fn().mockRejectedValue(
+        new Error('active ref changed'),
+      ),
+    };
+    const runtime = {
+      loadSession: vi.fn()
+        .mockRejectedValueOnce(new RuntimeAdapterError(
+          'session_not_found',
+          'old ref disappeared',
+          false,
+          'not-applied',
+        ))
+        .mockResolvedValueOnce({
+          externalSessionRef: 'fake-session-2',
+          runtimeVersion: '1',
+          replayStatus: 'complete',
+          historyDigest: 'sha256:before-run',
+          metadata: {},
+        }),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+
+    await expect(service.getSessionTranscript({
+      actor,
+      sessionId: ids.sessionId,
+    })).resolves.toMatchObject({ runtimeAvailability: 'available' });
+    expect(repository.markRuntimeSessionUnavailable).toHaveBeenCalledWith({
+      actor,
+      sessionId: ids.sessionId,
+      externalSessionRef: 'fake-session-1',
+      error: 'runtime_adapter:session_not_found:not-applied',
+    });
+    expect(runtime.loadSession).toHaveBeenCalledTimes(2);
+    expect(runtime.loadSession).toHaveBeenLastCalledWith(expect.objectContaining({
+      externalSessionRef: 'fake-session-2',
+    }));
+  });
+
+  it('does not hide an unconfirmed unavailable mark behind an unavailable DTO', async () => {
+    const persistenceFailure = new Error('database write failed');
+    const repository = {
+      loadSessionSnapshot: vi.fn().mockResolvedValue(sessionSnapshot),
+      getSessionRuntimeContext: vi.fn().mockResolvedValue({
+        ...sessionContext(),
+        status: 'active',
+        externalSessionRef: 'fake-session-1',
+      }),
+      markRuntimeSessionUnavailable: vi.fn().mockRejectedValue(persistenceFailure),
+    };
+    const runtime = {
+      loadSession: vi.fn().mockRejectedValue(new RuntimeAdapterError(
+        'session_not_found',
+        'missing',
+        false,
+        'not-applied',
+      )),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+
+    await expect(service.getSessionTranscript({
+      actor,
+      sessionId: ids.sessionId,
+    })).rejects.toBe(persistenceFailure);
+    expect(repository.loadSessionSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('detects a process-local Fake Session ref after Runtime restart', async () => {
+    const unavailableSnapshot = {
+      ...sessionSnapshot,
+      runtimeRef: {
+        externalSessionRef: 'fake-session-1',
+        status: 'error' as const,
+      },
+    };
+    const repository = {
+      loadSessionSnapshot: vi.fn()
+        .mockResolvedValueOnce(sessionSnapshot)
+        .mockResolvedValueOnce(unavailableSnapshot),
+      getSessionRuntimeContext: vi.fn().mockResolvedValue({
+        ...sessionContext(),
+        status: 'active',
+        externalSessionRef: 'fake-session-1',
+      }),
+      markRuntimeSessionUnavailable: vi.fn().mockResolvedValue(undefined),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      new DeterministicFakeRuntime(),
+      pump,
+    );
+
+    await expect(service.getSessionTranscript({
+      actor,
+      sessionId: ids.sessionId,
+    })).resolves.toMatchObject({
+      runtimeAvailability: 'unavailable',
+      reconciliationState: { kind: 'runtime-unavailable' },
+    });
+    expect(repository.markRuntimeSessionUnavailable).toHaveBeenCalledWith({
+      actor,
+      sessionId: ids.sessionId,
+      externalSessionRef: 'fake-session-1',
+      error: 'runtime_adapter:session_not_found:not-applied',
+    });
+  });
+
+  it('does not probe when the active Runtime context lost its external ref', async () => {
+    const repository = {
+      loadSessionSnapshot: vi.fn().mockResolvedValue(sessionSnapshot),
+      getSessionRuntimeContext: vi.fn().mockResolvedValue({
+        ...sessionContext(),
+        status: 'active',
+        externalSessionRef: null,
+      }),
+      markRuntimeSessionUnavailable: vi.fn(),
+    };
+    const runtime = { loadSession: vi.fn() };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+
+    await expect(service.getSessionTranscript({
+      actor,
+      sessionId: ids.sessionId,
+    })).resolves.toMatchObject({
+      runtimeAvailability: 'unavailable',
+      reconciliationState: { kind: 'runtime-unavailable' },
+    });
+    expect(runtime.loadSession).not.toHaveBeenCalled();
+    expect(repository.markRuntimeSessionUnavailable).not.toHaveBeenCalled();
+  });
+
+  it('does not permanently mark a transient Runtime probe failure', async () => {
+    const repository = {
+      loadSessionSnapshot: vi.fn().mockResolvedValue(sessionSnapshot),
+      getSessionRuntimeContext: vi.fn().mockResolvedValue({
+        ...sessionContext(),
+        status: 'active',
+        externalSessionRef: 'fake-session-1',
+      }),
+      markRuntimeSessionUnavailable: vi.fn(),
+    };
+    const reason = new RuntimeAdapterError(
+      'runtime_unavailable',
+      'temporary outage',
+      true,
+      'not-applied',
+    );
+    const runtime = { loadSession: vi.fn().mockRejectedValue(reason) };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      runtime as unknown as RuntimeAdapter,
+      pump,
+    );
+
+    await expect(service.getSessionTranscript({
+      actor,
+      sessionId: ids.sessionId,
+    })).rejects.toBe(reason);
+    expect(repository.markRuntimeSessionUnavailable).not.toHaveBeenCalled();
   });
 });

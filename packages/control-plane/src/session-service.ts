@@ -11,13 +11,18 @@ import type {
   OrchestrationPhase,
   PreparedRun,
   SessionRuntimeContext,
+  StoredSessionSnapshot,
 } from '@ai-super-canvas/db';
 
 import type {
   BootstrapLocalAlphaInput,
   CreatedSessionDto,
   CreateRootSessionInput,
+  GetRunEventsInput,
+  GetSessionTranscriptInput,
   LocalAlphaBootstrapDto,
+  RunEventsPageDto,
+  SessionTranscriptDto,
   StartedRunDto,
   StartSessionRunInput,
 } from './dto';
@@ -97,6 +102,130 @@ function toRuntimeContext(
       },
     };
   });
+}
+
+const privateRuntimePayloadKeys = new Set([
+  'eventId',
+  'externalEventRef',
+  'externalMessageRef',
+  'externalRunRef',
+  'externalSessionRef',
+  'runtimeEventKey',
+  'secretRef',
+]);
+
+function sanitizePrivateRuntimeFields(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizePrivateRuntimeFields(item));
+  }
+  if (value === null || typeof value !== 'object') return value;
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !privateRuntimePayloadKeys.has(key))
+      .map(([key, nested]) => [
+        key,
+        sanitizePrivateRuntimeFields(nested),
+      ]),
+  );
+}
+
+function pickRuntimePayloadFields(
+  value: Record<string, unknown>,
+  fields: readonly string[],
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (Object.hasOwn(value, field)) result[field] = value[field];
+  }
+  return result;
+}
+
+function sanitizeRuntimeEventPayload(
+  value: unknown,
+  eventType: string,
+): unknown {
+  const sanitized = sanitizePrivateRuntimeFields(value);
+  if (
+    sanitized === null
+    || typeof sanitized !== 'object'
+    || Array.isArray(sanitized)
+  ) {
+    return sanitized;
+  }
+  const record = sanitized as Record<string, unknown>;
+  const baseFields = [
+    'type',
+    'canvasSessionId',
+    'canvasRunId',
+    'externalSequence',
+    'occurredAt',
+    'code',
+  ] as const;
+  if (eventType === 'run.failed') {
+    return pickRuntimePayloadFields(record, [...baseFields, 'retryable']);
+  }
+  if (eventType === 'runtime.warning') {
+    return pickRuntimePayloadFields(record, baseFields);
+  }
+  return record;
+}
+
+function terminalStatus(
+  status: string,
+): RunEventsPageDto['terminal'] {
+  if (
+    status === 'succeeded'
+    || status === 'failed'
+    || status === 'cancelled'
+  ) {
+    return { status };
+  }
+  return null;
+}
+
+function pageIncludesTerminalEvent(
+  events: Array<{ eventType: string }>,
+  terminal: NonNullable<RunEventsPageDto['terminal']>,
+): boolean {
+  const eventType = terminal.status === 'succeeded'
+    ? 'run.completed'
+    : terminal.status === 'failed'
+      ? 'run.failed'
+      : 'run.cancelled';
+  return events.some((event) => event.eventType === eventType);
+}
+
+function toTranscriptDto(
+  snapshot: StoredSessionSnapshot,
+  runtimeAvailability: SessionTranscriptDto['runtimeAvailability'],
+): SessionTranscriptDto {
+  const reconciliationState = snapshot.activeRun?.status === 'reconciling'
+    ? {
+        kind: 'run-reconciling' as const,
+        message: 'Run requires reconciliation',
+      }
+    : runtimeAvailability === 'unavailable'
+      ? {
+          kind: 'runtime-unavailable' as const,
+          message: 'Runtime Session is unavailable; create a new test Session',
+        }
+      : null;
+  return {
+    sessionId: snapshot.sessionId,
+    status: snapshot.status,
+    messages: snapshot.messages.map((message) => ({
+      messageId: message.id,
+      runId: message.runId,
+      ordinal: message.ordinal,
+      role: message.role,
+      content: message.content,
+      status: message.status,
+    })),
+    activeRun: snapshot.activeRun,
+    reconciliationState,
+    runtimeAvailability,
+  };
 }
 
 function attachedSession(
@@ -260,6 +389,113 @@ export class SessionService {
     return runner;
   }
 
+  async getRunEvents(
+    input: GetRunEventsInput,
+  ): Promise<RunEventsPageDto> {
+    // Read status first: a terminal status and its event commit atomically, so
+    // the later page read cannot omit a terminal event while telling a client
+    // to stop polling.
+    const context = await this.repository.getRunRuntimeContext({
+      actor: input.actor,
+      runId: input.runId,
+    });
+    const events = await this.repository.listRunEvents(input);
+    const nextAfter = events.at(-1)?.sequence ?? input.after;
+    const persistedTerminal = terminalStatus(context.status);
+    let terminal = persistedTerminal;
+    if (
+      persistedTerminal !== null
+      && !pageIncludesTerminalEvent(events, persistedTerminal)
+    ) {
+      const unreadEvents = await this.repository.listRunEvents({
+        ...input,
+        after: nextAfter,
+        limit: 1,
+      });
+      if (unreadEvents.length > 0) terminal = null;
+    }
+    return {
+      events: events.map((event) => ({
+        sequence: event.sequence,
+        eventType: event.eventType,
+        payload: sanitizeRuntimeEventPayload(
+          event.payload,
+          event.eventType,
+        ),
+        occurredAt: event.occurredAt,
+      })),
+      nextAfter,
+      terminal,
+    };
+  }
+
+  async getSessionTranscript(
+    input: GetSessionTranscriptInput,
+  ): Promise<SessionTranscriptDto> {
+    let snapshot = await this.repository.loadSessionSnapshot(input);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (snapshot.runtimeRef?.status !== 'active') {
+        return toTranscriptDto(snapshot, 'unavailable');
+      }
+
+      const context = await this.repository.getSessionRuntimeContext(input);
+      const externalSessionRef = context.externalSessionRef;
+      if (!externalSessionRef) {
+        return toTranscriptDto(snapshot, 'unavailable');
+      }
+
+      try {
+        await this.runtime.loadSession({
+          commandId: `probe-session:${input.sessionId}`,
+          binding: toSessionBinding(context.binding),
+          canvasSessionId: input.sessionId,
+          externalSessionRef,
+        });
+        return toTranscriptDto(snapshot, 'available');
+      } catch (reason) {
+        if (
+          !(reason instanceof RuntimeAdapterError)
+          || reason.code !== 'session_not_found'
+          || reason.operationEffect !== 'not-applied'
+        ) {
+          throw reason;
+        }
+
+        const safeError = runtimeFailureCategory(
+          reason,
+          'runtime_session_probe_failed',
+        );
+        let markFailed = false;
+        let persistenceFailure: unknown;
+        try {
+          await this.repository.markRuntimeSessionUnavailable({
+            ...input,
+            externalSessionRef,
+            error: safeError,
+          });
+        } catch (persistenceReason) {
+          markFailed = true;
+          persistenceFailure = persistenceReason;
+        }
+
+        const refreshed = await this.repository.loadSessionSnapshot(input);
+        if (refreshed.runtimeRef?.status !== 'active') {
+          return toTranscriptDto(refreshed, 'unavailable');
+        }
+        if (
+          refreshed.runtimeRef.externalSessionRef !== externalSessionRef
+          && attempt === 0
+        ) {
+          snapshot = refreshed;
+          continue;
+        }
+        if (markFailed) throw persistenceFailure;
+        throw new Error('Runtime Session unavailable mark was not observed');
+      }
+    }
+    throw new Error('Runtime Session reference changed repeatedly during probe');
+  }
+
   private handoffAttachedRun(
     input: StartSessionRunInput,
     prepared: PreparedRun,
@@ -419,6 +655,7 @@ export class SessionService {
             () => this.repository.markRuntimeSessionUnavailable({
               actor: input.actor,
               sessionId: prepared.sessionId,
+              externalSessionRef: prepared.runtime.externalSessionRef,
               error,
             }),
           );
