@@ -3533,6 +3533,7 @@ describe('PostgresControlPlaneRepository', () => {
     await repository.syncRuntimeSessionHistory({
       actor: fixture.actor,
       sessionId: session.sessionId,
+      externalSessionRef,
       historyDigest: 'history-after-terminal-run',
     });
     await sql`
@@ -4484,6 +4485,112 @@ describe('PostgresControlPlaneRepository', () => {
     });
   });
 
+  it('rejects stale terminal history sync after the active Runtime Session ref rotates', async () => {
+    const suffix = 'history-sync-ref-cas';
+    const {
+      fixture,
+      session,
+      prepared,
+      externalSessionRef,
+    } = await prepareRuntimeRun({ suffix });
+    const runContext = await repository.getRunRuntimeContext({
+      actor: fixture.actor,
+      runId: prepared.runId,
+    });
+    expect(runContext.externalSessionRef).toBe(externalSessionRef);
+
+    const replacementRefId = '90909090-2020-4020-8020-202020202020';
+    const replacementExternalSessionRef = `${externalSessionRef}-rotated`;
+    const replacementHistoryDigest = `history-${suffix}-rotated`;
+    await sql.begin(async (tx) => {
+      const [retired] = await tx<{
+        external_session_ref: string;
+        history_digest: string;
+      }[]>`
+        UPDATE session_runtime_refs
+        SET is_primary = false, status = 'historical', updated_at = now()
+        WHERE session_id = ${session.sessionId}
+          AND external_session_ref = ${runContext.externalSessionRef}
+          AND is_primary = true
+          AND status = 'active'
+        RETURNING external_session_ref,
+          metadata->>'historyDigest' AS history_digest
+      `;
+      expect(retired).toEqual({
+        external_session_ref: externalSessionRef,
+        history_digest: `history-${suffix}`,
+      });
+      await tx`
+        INSERT INTO session_runtime_refs (
+          id, session_id, agent_binding_id, external_session_ref,
+          runtime_version, is_primary, status, metadata
+        ) VALUES (
+          ${replacementRefId}, ${session.sessionId}, ${fixture.agentBindingId},
+          ${replacementExternalSessionRef}, 'deterministic-v1', true, 'active',
+          ${sql.json({ historyDigest: replacementHistoryDigest })}
+        )
+      `;
+    });
+
+    type RuntimeRefDigest = {
+      external_session_ref: string;
+      history_digest: string;
+      is_primary: boolean;
+      status: string;
+    };
+    const beforeSync = await sql<RuntimeRefDigest[]>`
+      SELECT external_session_ref,
+        metadata->>'historyDigest' AS history_digest,
+        is_primary,
+        status::text AS status
+      FROM session_runtime_refs
+      WHERE session_id = ${session.sessionId}
+      ORDER BY external_session_ref
+    `;
+    expect(beforeSync).toEqual([
+      {
+        external_session_ref: externalSessionRef,
+        history_digest: `history-${suffix}`,
+        is_primary: false,
+        status: 'historical',
+      },
+      {
+        external_session_ref: replacementExternalSessionRef,
+        history_digest: replacementHistoryDigest,
+        is_primary: true,
+        status: 'active',
+      },
+    ]);
+
+    let syncError: unknown;
+    try {
+      await repository.syncRuntimeSessionHistory({
+        actor: fixture.actor,
+        sessionId: session.sessionId,
+        externalSessionRef: runContext.externalSessionRef,
+        historyDigest: 'must-not-overwrite-rotated-ref',
+      });
+    } catch (error) {
+      syncError = error;
+    }
+    const afterSync = await sql<RuntimeRefDigest[]>`
+      SELECT external_session_ref,
+        metadata->>'historyDigest' AS history_digest,
+        is_primary,
+        status::text AS status
+      FROM session_runtime_refs
+      WHERE session_id = ${session.sessionId}
+      ORDER BY external_session_ref
+    `;
+    expect({
+      error: syncError instanceof Error ? syncError.message : null,
+      refs: afterSync,
+    }).toEqual({
+      error: 'Session active primary Runtime reference changed before history sync',
+      refs: beforeSync,
+    });
+  });
+
   it('loads a consistent Session snapshot and persists Runtime history and unavailable state', async () => {
     const { fixture, session, prepared, externalSessionRef } = await prepareRuntimeRun({
       suffix: 'session-snapshot',
@@ -4491,6 +4598,7 @@ describe('PostgresControlPlaneRepository', () => {
     await repository.syncRuntimeSessionHistory({
       actor: fixture.actor,
       sessionId: session.sessionId,
+      externalSessionRef,
       historyDigest: 'history-snapshot-updated',
     });
     await expect(repository.loadSessionSnapshot({
@@ -4555,6 +4663,7 @@ describe('PostgresControlPlaneRepository', () => {
     await expect(repository.syncRuntimeSessionHistory({
       actor: fixture.actor,
       sessionId: session.sessionId,
+      externalSessionRef,
       historyDigest: 'must-not-sync-error-ref',
     })).rejects.toThrow(/active primary Runtime reference/i);
 
@@ -4684,6 +4793,7 @@ describe('PostgresControlPlaneRepository', () => {
     await expect(repository.syncRuntimeSessionHistory({
       actor: viewer,
       sessionId: session.sessionId,
+      externalSessionRef,
       historyDigest: 'viewer-write',
     })).rejects.toThrow('Unauthorized control-plane operation');
     await expect(repository.markRuntimeSessionUnavailable({

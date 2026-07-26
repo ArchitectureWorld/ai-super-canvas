@@ -3106,6 +3106,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async syncRuntimeSessionHistory(input: {
     actor: ActorContext;
     sessionId: string;
+    externalSessionRef: string;
     historyDigest: string;
   }): Promise<void> {
     await this.sql.begin(async (tx) => {
@@ -3115,11 +3116,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         SET metadata = metadata || ${tx.json({ historyDigest: input.historyDigest })},
           updated_at = now()
         WHERE session_id = ${input.sessionId}
+          AND external_session_ref = ${input.externalSessionRef}
           AND is_primary = true AND status = 'active'
         RETURNING id
       `;
       if (!runtimeRef) {
-        throw new Error('Session has no active primary Runtime reference');
+        throw new Error(
+          'Session active primary Runtime reference changed before history sync',
+        );
       }
     });
   }

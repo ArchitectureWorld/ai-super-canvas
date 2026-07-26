@@ -367,6 +367,7 @@ export interface ControlPlaneRepository {
   syncRuntimeSessionHistory(input: {
     actor: ActorContext;
     sessionId: string;
+    externalSessionRef: string;
     historyDigest: string;
   }): Promise<void>;
   markRuntimeSessionUnavailable(input: {
