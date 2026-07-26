@@ -64,6 +64,31 @@ interface ApiErrorPayload {
   commandReceiptId?: string;
 }
 
+interface JsonResponse {
+  payload: unknown;
+  status: number;
+}
+
+interface CreatedSessionResult {
+  sessionId: string;
+  nodeId: string;
+  status: 'active';
+}
+
+type StoredRunStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting_approval'
+  | 'reconciling'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled';
+
+interface StartedRunResult {
+  runId: string;
+  status: StoredRunStatus;
+}
+
 interface PendingRun {
   commandId: string;
   idempotencyKey: string;
@@ -73,7 +98,7 @@ interface PendingRun {
 
 const recoveryByCode: Record<string, string> = {
   command_requires_reconciliation:
-    '服务器正在确认上次操作。请稍后重试，页面会复用同一个命令编号。',
+    '服务器正在确认上次操作。请稍后点“重试上次操作”，不要重复新建。',
   command_persistence_unconfirmed:
     '服务器暂时无法确认是否已保存。请稍后重试，页面会复用同一个命令编号。',
   runtime_session_unavailable:
@@ -120,15 +145,181 @@ function isApiErrorPayload(value: unknown): value is ApiErrorPayload {
   );
 }
 
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && uuidPattern.test(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function isReadyResult(value: unknown): value is {
+  status: 'ready';
+  database: 'ready';
+} {
+  return (
+    isRecord(value)
+    && value.status === 'ready'
+    && value.database === 'ready'
+  );
+}
+
+function isBootstrapResult(value: unknown): value is BootstrapResult {
+  return (
+    isRecord(value)
+    && isUuid(value.accountId)
+    && isUuid(value.agentId)
+    && isUuid(value.agentBindingId)
+    && isUuid(value.workspaceId)
+    && isUuid(value.workflowId)
+    && isUuid(value.trunkRevisionId)
+  );
+}
+
+function isCreatedSessionResult(
+  value: unknown,
+): value is CreatedSessionResult {
+  return (
+    isRecord(value)
+    && isUuid(value.sessionId)
+    && isUuid(value.nodeId)
+    && value.status === 'active'
+  );
+}
+
+function isStoredRunStatus(value: unknown): value is StoredRunStatus {
+  return (
+    value === 'queued'
+    || value === 'running'
+    || value === 'waiting_approval'
+    || value === 'reconciling'
+    || value === 'succeeded'
+    || value === 'failed'
+    || value === 'cancelled'
+  );
+}
+
+function isStartedRunResult(value: unknown): value is StartedRunResult {
+  return (
+    isRecord(value)
+    && isUuid(value.runId)
+    && isStoredRunStatus(value.status)
+  );
+}
+
+function isSessionMessage(value: unknown): value is SessionMessage {
+  return (
+    isRecord(value)
+    && isUuid(value.messageId)
+    && (value.runId === null || isUuid(value.runId))
+    && Number.isInteger(value.ordinal)
+    && typeof value.ordinal === 'number'
+    && value.ordinal >= 0
+    && (
+      value.role === 'user'
+      || value.role === 'assistant'
+      || value.role === 'system'
+      || value.role === 'tool'
+    )
+    && Object.hasOwn(value, 'content')
+    && isNonEmptyString(value.status)
+  );
+}
+
+function isActiveRun(value: unknown): value is NonNullable<
+  SessionTranscript['activeRun']
+> {
+  return (
+    isRecord(value)
+    && isUuid(value.runId)
+    && isStoredRunStatus(value.status)
+  );
+}
+
+function isReconciliationState(value: unknown): value is NonNullable<
+  SessionTranscript['reconciliationState']
+> {
+  return (
+    isRecord(value)
+    && (
+      value.kind === 'run-reconciling'
+      || value.kind === 'runtime-unavailable'
+    )
+    && isNonEmptyString(value.message)
+  );
+}
+
+function isSessionTranscript(value: unknown): value is SessionTranscript {
+  return (
+    isRecord(value)
+    && isUuid(value.sessionId)
+    && isNonEmptyString(value.status)
+    && Array.isArray(value.messages)
+    && value.messages.every(isSessionMessage)
+    && (value.activeRun === null || isActiveRun(value.activeRun))
+    && (
+      value.reconciliationState === null
+      || isReconciliationState(value.reconciliationState)
+    )
+    && (
+      value.runtimeAvailability === 'available'
+      || value.runtimeAvailability === 'unavailable'
+    )
+  );
+}
+
+function isRunEvent(value: unknown): value is RunEvent {
+  return (
+    isRecord(value)
+    && Number.isInteger(value.sequence)
+    && typeof value.sequence === 'number'
+    && value.sequence > 0
+    && isNonEmptyString(value.eventType)
+    && Object.hasOwn(value, 'payload')
+    && isNonEmptyString(value.occurredAt)
+  );
+}
+
+function isRunEventsPage(value: unknown): value is RunEventsPage {
+  return (
+    isRecord(value)
+    && Array.isArray(value.events)
+    && value.events.every(isRunEvent)
+    && Number.isInteger(value.nextAfter)
+    && typeof value.nextAfter === 'number'
+    && value.nextAfter >= 0
+    && (
+      value.terminal === null
+      || (
+        isRecord(value.terminal)
+        && (
+          value.terminal.status === 'succeeded'
+          || value.terminal.status === 'failed'
+          || value.terminal.status === 'cancelled'
+        )
+      )
+    )
+  );
+}
+
 function recoveryMessage(code: string): string {
   return recoveryByCode[code]
     ?? '操作没有完成。请重新连接后再试；页面不会自动重复写入。';
 }
 
-async function jsonRequest<T>(
+function invalidResponse(status?: number): ClientRequestError {
+  return new ClientRequestError(
+    'invalid_response',
+    recoveryMessage('invalid_response'),
+    false,
+    status,
+  );
+}
+
+async function jsonRequest(
   url: string,
   init: RequestInit = {},
-): Promise<T> {
+): Promise<JsonResponse> {
   const headers = new Headers(init.headers);
   if (init.body !== undefined) headers.set('Content-Type', 'application/json');
 
@@ -151,14 +342,17 @@ async function jsonRequest<T>(
     );
   }
 
-  if (isApiErrorPayload(payload)) {
-    throw new ClientRequestError(
-      payload.error.code,
-      recoveryMessage(payload.error.code),
-      payload.error.retryable,
-      response.status,
-      payload.commandReceiptId,
-    );
+  if (isRecord(payload) && Object.hasOwn(payload, 'error')) {
+    if (isApiErrorPayload(payload)) {
+      throw new ClientRequestError(
+        payload.error.code,
+        recoveryMessage(payload.error.code),
+        payload.error.retryable,
+        response.status,
+        payload.commandReceiptId,
+      );
+    }
+    throw invalidResponse(response.status);
   }
 
   if (!response.ok) {
@@ -171,7 +365,21 @@ async function jsonRequest<T>(
     );
   }
 
-  return payload as T;
+  return { payload, status: response.status };
+}
+
+function validatedPayload<T>(
+  response: JsonResponse,
+  expectedStatus: number,
+  validator: (value: unknown) => value is T,
+): T {
+  if (
+    response.status !== expectedStatus
+    || !validator(response.payload)
+  ) {
+    throw invalidResponse(response.status);
+  }
+  return response.payload;
 }
 
 function storedUuid(key: string): string | null {
@@ -252,6 +460,13 @@ function displayError(reason: unknown): string {
     : '页面操作失败。请重新连接后再试。';
 }
 
+function isConfirmedTerminalRunError(reason: unknown): boolean {
+  return (
+    reason instanceof ClientRequestError
+    && (reason.code === 'run_failed' || reason.code === 'run_cancelled')
+  );
+}
+
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
@@ -267,12 +482,19 @@ export function ControlPlaneTestClient() {
   const [busy, setBusy] = useState(false);
   const [hasPendingSession, setHasPendingSession] = useState(false);
   const [pendingRun, setPendingRun] = useState<PendingRun | null>(null);
+  const [recoveryHydrated, setRecoveryHydrated] = useState(false);
+  const [clientActiveRunId, setClientActiveRunId] = useState<string | null>(
+    null,
+  );
   const initialized = useRef(false);
+  const pollingRunId = useRef<string | null>(null);
 
   const loadTranscript = useCallback(async (sessionId: string) => {
-    const next = await jsonRequest<SessionTranscript>(
+    const response = await jsonRequest(
       `/api/control-plane/sessions/${sessionId}/transcript`,
     );
+    const next = validatedPayload(response, 200, isSessionTranscript);
+    if (next.sessionId !== sessionId) throw invalidResponse(response.status);
     setTranscript(next);
     return next;
   }, []);
@@ -281,12 +503,14 @@ export function ControlPlaneTestClient() {
     setBusy(true);
     setError('');
     setReady(false);
+    setRecoveryHydrated(false);
     setStatus('正在连接 PostgreSQL');
 
     try {
-      await jsonRequest<{ status: 'ready'; database: 'ready' }>('/api/ready');
+      const readyResponse = await jsonRequest('/api/ready');
+      validatedPayload(readyResponse, 200, isReadyResult);
       setStatus('正在初始化本地账号和工作区');
-      const result = await jsonRequest<BootstrapResult>(
+      const bootstrapResponse = await jsonRequest(
         '/api/control-plane/bootstrap',
         {
           method: 'POST',
@@ -296,20 +520,23 @@ export function ControlPlaneTestClient() {
           }),
         },
       );
+      const result = validatedPayload(
+        bootstrapResponse,
+        200,
+        isBootstrapResult,
+      );
       localStorage.removeItem(bootstrapCommandKey);
       setBootstrap(result);
       setReady(true);
 
       const pendingSession = storedUuid(pendingSessionCommandKey);
       setHasPendingSession(Boolean(pendingSession));
-      const restoredPendingRun = storedPendingRun();
-      setPendingRun(restoredPendingRun);
-      if (restoredPendingRun) setContent(restoredPendingRun.content);
 
-      const lastSessionId = storedUuid(lastSessionKey);
+      let lastSessionId = storedUuid(lastSessionKey);
       if (lastSessionId) {
         try {
-          await loadTranscript(lastSessionId);
+          const restoredTranscript = await loadTranscript(lastSessionId);
+          setClientActiveRunId(restoredTranscript.activeRun?.runId ?? null);
           setStatus('历史已从 PostgreSQL 恢复');
         } catch (reason) {
           if (
@@ -318,18 +545,38 @@ export function ControlPlaneTestClient() {
           ) {
             localStorage.removeItem(lastSessionKey);
             setTranscript(null);
+            setEvents([]);
+            setClientActiveRunId(null);
+            lastSessionId = null;
             setStatus('后端已就绪');
           } else {
             throw reason;
           }
         }
       } else {
+        setTranscript(null);
+        setEvents([]);
+        setClientActiveRunId(null);
         setStatus('后端已就绪');
       }
+
+      const restoredPendingRun = storedPendingRun();
+      if (
+        restoredPendingRun
+        && restoredPendingRun.sessionId === lastSessionId
+      ) {
+        setPendingRun(restoredPendingRun);
+        setContent(restoredPendingRun.content);
+      } else {
+        localStorage.removeItem(pendingRunCommandKey);
+        setPendingRun(null);
+      }
     } catch (reason) {
+      setReady(false);
       setError(displayError(reason));
       setStatus('连接失败');
     } finally {
+      setRecoveryHydrated(true);
       setBusy(false);
     }
   }, [loadTranscript]);
@@ -341,19 +588,16 @@ export function ControlPlaneTestClient() {
   }, [initialize]);
 
   const createSession = useCallback(async () => {
-    if (!bootstrap || busy) return;
+    if (!bootstrap || !ready || busy) return;
     setBusy(true);
     setError('');
     setStatus('正在创建 Canvas Session 和 Runtime Session');
     const pendingCommandId = commandId(pendingSessionCommandKey);
     setHasPendingSession(true);
+    let createdSessionId: string | null = null;
 
     try {
-      const result = await jsonRequest<{
-        sessionId: string;
-        nodeId: string;
-        status: string;
-      }>('/api/control-plane/sessions', {
+      const sessionResponse = await jsonRequest('/api/control-plane/sessions', {
         method: 'POST',
         body: JSON.stringify({
           commandId: pendingCommandId,
@@ -362,33 +606,61 @@ export function ControlPlaneTestClient() {
           title: '真实后端测试 Session',
         }),
       });
+      const result = validatedPayload(
+        sessionResponse,
+        201,
+        isCreatedSessionResult,
+      );
+      createdSessionId = result.sessionId;
       localStorage.removeItem(pendingSessionCommandKey);
       localStorage.setItem(lastSessionKey, result.sessionId);
       localStorage.removeItem(pendingRunCommandKey);
       setHasPendingSession(false);
       setPendingRun(null);
       setEvents([]);
+      setClientActiveRunId(null);
+      setTranscript(null);
+      setContent('');
       await loadTranscript(result.sessionId);
       setStatus('Session 已连接 Fake Runtime');
     } catch (reason) {
       setError(displayError(reason));
-      setStatus('新建 Session 未完成');
+      setStatus(
+        createdSessionId
+          ? 'Session 已创建，但记录加载失败，请重新连接'
+          : '新建 Session 未完成',
+      );
     } finally {
       setBusy(false);
     }
-  }, [bootstrap, busy, loadTranscript]);
+  }, [bootstrap, busy, loadTranscript, ready]);
 
   const pollRun = useCallback(async (sessionId: string, runId: string) => {
     let after = 0;
     for (let attempt = 0; attempt < 80; attempt += 1) {
-      const page = await jsonRequest<RunEventsPage>(
+      const eventsResponse = await jsonRequest(
         `/api/control-plane/runs/${runId}/events?after=${after}`,
       );
+      const page = validatedPayload(
+        eventsResponse,
+        200,
+        isRunEventsPage,
+      );
+      const greatestPageSequence = page.events.reduce(
+        (greatest, event) => Math.max(greatest, event.sequence),
+        after,
+      );
+      if (
+        page.nextAfter < after
+        || page.nextAfter < greatestPageSequence
+      ) {
+        throw invalidResponse(eventsResponse.status);
+      }
       setEvents((current) => {
-        const seen = new Set(current.map(({ sequence }) => sequence));
+        const lastSequence = current.at(-1)?.sequence ?? 0;
         return [
           ...current,
-          ...page.events.filter(({ sequence }) => !seen.has(sequence)),
+          ...page.events.filter(({ sequence }) => sequence > lastSequence),
         ].sort((left, right) => left.sequence - right.sequence);
       });
       after = page.nextAfter;
@@ -417,10 +689,89 @@ export function ControlPlaneTestClient() {
     );
   }, [loadTranscript]);
 
+  useEffect(() => {
+    const activeRun = transcript?.activeRun;
+    if (
+      !transcript
+      || !activeRun
+      || !ready
+      || !recoveryHydrated
+      || transcript.runtimeAvailability !== 'available'
+      || transcript.reconciliationState
+      || pollingRunId.current === activeRun.runId
+    ) {
+      return;
+    }
+
+    pollingRunId.current = activeRun.runId;
+    setClientActiveRunId(activeRun.runId);
+    setEvents([]);
+    setBusy(true);
+    setError('');
+    setStatus('正在恢复未完成 Run');
+
+    const resumeRun = async () => {
+      if (pendingRun?.sessionId === transcript.sessionId) {
+        const runResponse = await jsonRequest(
+          `/api/control-plane/sessions/${transcript.sessionId}/runs`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              commandId: pendingRun.commandId,
+              idempotencyKey: pendingRun.idempotencyKey,
+              content: pendingRun.content,
+            }),
+          },
+        );
+        const result = validatedPayload(
+          runResponse,
+          202,
+          isStartedRunResult,
+        );
+        if (result.runId !== activeRun.runId) {
+          throw invalidResponse(runResponse.status);
+        }
+        localStorage.removeItem(pendingRunCommandKey);
+        setPendingRun(null);
+      }
+      await pollRun(transcript.sessionId, activeRun.runId);
+    };
+
+    void resumeRun()
+      .then(() => {
+        setClientActiveRunId(null);
+        setContent('');
+        setStatus('回复已写入 PostgreSQL');
+      })
+      .catch((reason: unknown) => {
+        if (isConfirmedTerminalRunError(reason)) {
+          setClientActiveRunId(null);
+        }
+        setError(displayError(reason));
+        setStatus('恢复 Run 未完成');
+      })
+      .finally(() => {
+        if (pollingRunId.current === activeRun.runId) {
+          pollingRunId.current = null;
+        }
+        setBusy(false);
+      });
+  }, [
+    pendingRun,
+    pollRun,
+    ready,
+    recoveryHydrated,
+    transcript,
+  ]);
+
   const sendMessage = useCallback(async () => {
     if (
       !transcript
+      || !ready
       || transcript.runtimeAvailability !== 'available'
+      || transcript.activeRun
+      || transcript.reconciliationState
+      || clientActiveRunId
       || busy
     ) {
       return;
@@ -429,6 +780,7 @@ export function ControlPlaneTestClient() {
     const restored = storedPendingRun();
     if (restored && restored.sessionId !== transcript.sessionId) {
       localStorage.removeItem(pendingRunCommandKey);
+      setPendingRun(null);
     }
     const trimmedContent = content.trim();
     const nextPending = restored?.sessionId === transcript.sessionId
@@ -451,7 +803,7 @@ export function ControlPlaneTestClient() {
     setStatus('Runtime 正在生成回复');
 
     try {
-      const result = await jsonRequest<{ runId: string; status: string }>(
+      const runResponse = await jsonRequest(
         `/api/control-plane/sessions/${transcript.sessionId}/runs`,
         {
           method: 'POST',
@@ -462,22 +814,51 @@ export function ControlPlaneTestClient() {
           }),
         },
       );
+      const result = validatedPayload(
+        runResponse,
+        202,
+        isStartedRunResult,
+      );
+      setClientActiveRunId(result.runId);
       localStorage.removeItem(pendingRunCommandKey);
       setPendingRun(null);
-      await pollRun(transcript.sessionId, result.runId);
+      setEvents([]);
+      pollingRunId.current = result.runId;
+      try {
+        await pollRun(transcript.sessionId, result.runId);
+      } finally {
+        if (pollingRunId.current === result.runId) {
+          pollingRunId.current = null;
+        }
+      }
+      setClientActiveRunId(null);
       setContent('');
       setStatus('回复已写入 PostgreSQL');
     } catch (reason) {
+      if (isConfirmedTerminalRunError(reason)) {
+        setClientActiveRunId(null);
+      }
       setError(displayError(reason));
       setStatus('发送未完成');
     } finally {
       setBusy(false);
     }
-  }, [busy, content, pollRun, transcript]);
+  }, [
+    busy,
+    clientActiveRunId,
+    content,
+    pollRun,
+    ready,
+    transcript,
+  ]);
 
   const canSend = Boolean(
     transcript
+    && ready
     && transcript.runtimeAvailability === 'available'
+    && !transcript.activeRun
+    && !transcript.reconciliationState
+    && !clientActiveRunId
     && content.trim()
     && content.trim().length <= 20_000
     && !busy,
@@ -498,7 +879,7 @@ export function ControlPlaneTestClient() {
             <button
               className={styles.primaryButton}
               type="button"
-              disabled={!bootstrap || busy}
+              disabled={!bootstrap || !ready || busy}
               onClick={() => void createSession()}
             >
               {hasPendingSession ? '重试新建 Session' : '新建测试 Session'}
@@ -561,10 +942,16 @@ export function ControlPlaneTestClient() {
                 </div>
                 <span
                   className={`${styles.stateBadge} ${
-                    transcript ? styles.success : styles.warning
+                    transcript && !transcript.reconciliationState
+                      ? styles.success
+                      : styles.warning
                   }`}
                 >
-                  {transcript ? transcript.status : '等待 Session'}
+                  {transcript?.reconciliationState
+                    ? '对账中'
+                    : transcript
+                      ? transcript.status
+                      : '等待 Session'}
                 </span>
               </div>
               {transcript?.messages.length ? (
@@ -623,7 +1010,11 @@ export function ControlPlaneTestClient() {
                 onChange={(event) => setContent(event.target.value)}
                 disabled={
                   !transcript
+                  || !ready
                   || transcript.runtimeAvailability !== 'available'
+                  || Boolean(transcript.activeRun)
+                  || Boolean(transcript.reconciliationState)
+                  || Boolean(clientActiveRunId)
                   || busy
                 }
               />
@@ -650,7 +1041,11 @@ export function ControlPlaneTestClient() {
               <div className={styles.panelHeading}>
                 <div>
                   <p className={styles.eyebrow}>BACKEND STATUS</p>
-                  <h2 className={styles.sectionTitle} id="backend-status-title">
+                  <h2
+                    aria-live="polite"
+                    className={styles.sectionTitle}
+                    id="backend-status-title"
+                  >
                     {status}
                   </h2>
                 </div>
