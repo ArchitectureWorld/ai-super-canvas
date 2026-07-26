@@ -25,7 +25,7 @@ Task 1 的部署基线面向：
 ```bash
 git clone https://github.com/ArchitectureWorld/ai-super-canvas.git
 cd ai-super-canvas
-git switch feat/risk-first-vertical-slice
+git switch main
 cp .env.example .env
 ```
 
@@ -40,7 +40,8 @@ openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
 ```dotenv
 APP_BIND_ADDRESS=127.0.0.1
 APP_PORT=3000
-APP_OWNER_ID=local-owner
+AUTH_MODE=local
+APP_OWNER_SUBJECT=local:owner
 POSTGRES_USER=canvas
 POSTGRES_PASSWORD=上一步生成的URL安全随机字符串
 POSTGRES_DB=canvas
@@ -52,19 +53,37 @@ AI_DEFAULT_MODEL=deterministic-v1
 
 `AI_AVAILABLE_MODELS` 是画布块可选择模型的逗号分隔目录，`AI_DEFAULT_MODEL` 必须是其中一项。示例只声明模型名称；真实 provider secret 只写入部署主机的 `.env`，不得提交到 Git。
 
-启动：
+先启动 PostgreSQL，并用一次性迁移镜像升级数据库：
 
 ```bash
-docker compose build
-docker compose up -d
+docker compose up -d postgres
+docker build --target test --tag ai-super-canvas:migrator .
+docker run --rm \
+  --network ai-super-canvas_default \
+  --env-file .env \
+  --entrypoint sh \
+  ai-super-canvas:migrator \
+  -eu -c 'export DATABASE_URL="postgres://${POSTGRES_USER:-canvas}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-canvas}"; pnpm --filter @ai-super-canvas/db db:migrate'
+```
+
+迁移成功后再构建并启动应用：
+
+```bash
+docker compose build app
+docker compose up -d app
 docker compose ps
 ```
 
-健康检查：
+分别检查进程存活和数据库就绪：
 
 ```bash
 curl --fail http://127.0.0.1:3000/api/health
+curl --fail http://127.0.0.1:3000/api/ready
 ```
+
+当前 Compose 的 `DATABASE_URL` 使用数据库 owner。受限应用角色及最小权限
+grants 仍是开放 LAN 访问前的部署硬门槛；在完成该接线前保持
+`APP_BIND_ADDRESS=127.0.0.1`。
 
 ## 4. 访问方式
 
@@ -153,14 +172,22 @@ docker compose stop app
 
 ```bash
 git pull --ff-only
-docker compose build --pull
-docker compose up -d
+docker compose up -d postgres
+docker build --pull --target test --tag ai-super-canvas:migrator .
+docker run --rm \
+  --network ai-super-canvas_default \
+  --env-file .env \
+  --entrypoint sh \
+  ai-super-canvas:migrator \
+  -eu -c 'export DATABASE_URL="postgres://${POSTGRES_USER:-canvas}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-canvas}"; pnpm --filter @ai-super-canvas/db db:migrate'
+docker compose build --pull app
+docker compose up -d app
 docker image prune -f
 ```
 
-更新前先备份 PostgreSQL。
-
-Task 1 的运行镜像只包含生产应用，不包含 pnpm 和源码，因此不能在 `app` 容器内临时执行迁移。后续引入领域表时，仓库会增加独立的 migration image / Compose profile；在此之前没有数据库迁移需要执行。
+更新前先备份 PostgreSQL。运行镜像只包含生产应用，不包含 pnpm 和源码，
+因此迁移必须通过上面的一次性 `ai-super-canvas:migrator` 镜像完成，不能进入
+`app` 容器临时执行。
 
 ## 8. 日志与排查
 
@@ -179,7 +206,7 @@ docker stats
 如果应用容器不健康：
 
 1. 检查 `/api/health`；
-2. 检查数据库健康状态；
+2. 检查 `/api/ready` 和迁移是否成功；
 3. 检查 `.env` 中的密码和端口；
 4. 检查 NAS 防火墙和反向代理；
 5. 检查 CPU 架构与镜像拉取日志。
