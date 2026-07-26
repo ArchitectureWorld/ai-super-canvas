@@ -116,6 +116,100 @@ describe('PostgresControlPlaneRepository', () => {
     return { fixture, session, prepared, externalSessionRef, externalRunRef };
   }
 
+  async function loadRunReconciliationState(commandReceiptId: string) {
+    return sql<{
+      receipt_phase: string;
+      receipt_kind: string | null;
+      receipt_ref: string | null;
+      receipt_error: string | null;
+      run_ref: string | null;
+      run_status: string;
+      run_started_at: Date | null;
+      run_error_code: string | null;
+      run_error_message: string | null;
+      run_completed_at: Date | null;
+      compensation_status: string;
+      compensation_attempts: number;
+      compensation_ref: string | null;
+      compensation_evidence: Record<string, unknown>;
+      compensation_error: string | null;
+    }[]>`
+      SELECT receipt.orchestration_phase::text AS receipt_phase,
+        receipt.external_resource_kind AS receipt_kind,
+        receipt.external_resource_ref AS receipt_ref,
+        receipt.last_error AS receipt_error,
+        run.runtime_run_ref AS run_ref, run.status::text AS run_status,
+        run.started_at AS run_started_at, run.error_code AS run_error_code,
+        run.error_message AS run_error_message,
+        run.completed_at AS run_completed_at,
+        compensation.status::text AS compensation_status,
+        compensation.attempts AS compensation_attempts,
+        compensation.external_resource_ref AS compensation_ref,
+        compensation.resolution_evidence AS compensation_evidence,
+        compensation.last_error AS compensation_error
+      FROM command_receipts receipt
+      JOIN runs run ON run.id = receipt.result_id
+      JOIN runtime_compensations compensation
+        ON compensation.command_receipt_id = receipt.id
+       AND compensation.external_resource_kind = 'run'
+       AND compensation.action = 'adopt'
+      WHERE receipt.id = ${commandReceiptId}
+      ORDER BY compensation.created_at, compensation.id
+    `;
+  }
+
+  async function loadSessionReconciliationState(commandReceiptId: string) {
+    return sql<{
+      receipt_result_type: string;
+      receipt_phase: string;
+      receipt_kind: string | null;
+      receipt_ref: string | null;
+      receipt_error: string | null;
+      receipt_completed_at: Date | null;
+      session_status: string;
+      runtime_ref: string;
+      runtime_binding_id: string;
+      runtime_is_primary: boolean;
+      runtime_status: string;
+      compensation_status: string;
+      compensation_attempts: number;
+      compensation_ref: string | null;
+      compensation_evidence: Record<string, unknown>;
+      compensation_error: string | null;
+      compensation_resolved_at: Date | null;
+    }[]>`
+      SELECT receipt.result_type AS receipt_result_type,
+        receipt.orchestration_phase::text AS receipt_phase,
+        receipt.external_resource_kind AS receipt_kind,
+        receipt.external_resource_ref AS receipt_ref,
+        receipt.last_error AS receipt_error,
+        receipt.completed_at AS receipt_completed_at,
+        session.status::text AS session_status,
+        runtime_ref.external_session_ref AS runtime_ref,
+        runtime_ref.agent_binding_id AS runtime_binding_id,
+        runtime_ref.is_primary AS runtime_is_primary,
+        runtime_ref.status::text AS runtime_status,
+        compensation.status::text AS compensation_status,
+        compensation.attempts AS compensation_attempts,
+        compensation.external_resource_ref AS compensation_ref,
+        compensation.resolution_evidence AS compensation_evidence,
+        compensation.last_error AS compensation_error,
+        compensation.resolved_at AS compensation_resolved_at
+      FROM command_receipts receipt
+      JOIN sessions session ON session.id = receipt.result_id
+      JOIN session_runtime_refs runtime_ref
+        ON runtime_ref.session_id = session.id
+       AND runtime_ref.is_primary = true
+       AND runtime_ref.status = 'active'
+      JOIN runtime_compensations compensation
+        ON compensation.command_receipt_id = receipt.id
+       AND compensation.external_resource_kind = 'session'
+       AND compensation.action = 'adopt'
+      WHERE receipt.id = ${commandReceiptId}
+      ORDER BY compensation.created_at, compensation.id
+    `;
+  }
+
   it('bootstraps concurrent identical commands once and compares exact UTF-8 canonical payloads', async () => {
     const input = {
       commandId: '40404040-4040-4040-8040-404040404040',
@@ -2137,6 +2231,139 @@ describe('PostgresControlPlaneRepository', () => {
     });
   });
 
+  it('returns the Session resource on adoption replay and rejects a conflicting attached ref without mutation', async () => {
+    const fixture = await bootstrapFixture();
+    const session = await repository.createRootSession({
+      actor: fixture.actor,
+      commandId: '69696969-6969-4969-8969-696969696969',
+      workflowId: fixture.workflowId,
+      agentBindingId: fixture.agentBindingId,
+      title: 'Strict Session replay',
+    });
+    const externalSessionRef = 'fake-session:strict-replay';
+    await repository.beginRuntimeDispatch({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+    });
+    await repository.recordRuntimeResourceKnown({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: externalSessionRef,
+    });
+    await repository.markRuntimeCommandReconciling({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      externalResourceKind: 'session',
+      externalResourceRef: externalSessionRef,
+      error: 'Session attach outcome unknown',
+    });
+    const resolution = {
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      resolution: {
+        kind: 'adopt-session' as const,
+        runtimeSession: {
+          externalSessionRef,
+          runtimeVersion: 'deterministic-v1',
+          replayStatus: 'complete' as const,
+          historyDigest: 'sha256:strict-session-replay',
+          metadata: { source: 'strict-replay' },
+        },
+        evidence: { lookup: 'single-match' },
+      },
+    };
+    const expected = {
+      phase: 'attached',
+      outcome: 'adopted',
+      resource: {
+        kind: 'session',
+        sessionId: session.sessionId,
+      },
+    };
+
+    await expect(
+      repository.resolveRuntimeReconciliation(resolution),
+    ).resolves.toEqual(expected);
+    await expect(
+      repository.resolveRuntimeReconciliation({ ...resolution }),
+    ).resolves.toEqual(expected);
+    const before = await loadSessionReconciliationState(
+      session.commandReceiptId,
+    );
+
+    await expect(repository.resolveRuntimeReconciliation({
+      actor: fixture.actor,
+      commandReceiptId: session.commandReceiptId,
+      resolution: {
+        kind: 'adopt-session',
+        runtimeSession: {
+          ...resolution.resolution.runtimeSession,
+          externalSessionRef: `${externalSessionRef}:wrong`,
+        },
+        evidence: { lookup: 'conflicting-match' },
+      },
+    })).rejects.toThrow(/conflict/i);
+
+    expect(
+      await loadSessionReconciliationState(session.commandReceiptId),
+    ).toEqual(before);
+  });
+
+  it('rejects adopt-session for an attached Run receipt without mutation', async () => {
+    const {
+      fixture,
+      prepared,
+      externalSessionRef,
+      externalRunRef,
+    } = await prepareRuntimeRun({
+      suffix: 'run-session-kind-conflict',
+      attachRun: false,
+    });
+    await repository.markRuntimeCommandReconciling({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      externalResourceKind: 'run',
+      externalResourceRef: externalRunRef,
+      error: 'Run attach outcome unknown',
+    });
+    await repository.resolveRuntimeReconciliation({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      resolution: {
+        kind: 'adopt-run',
+        runtimeRun: {
+          externalRunRef,
+          acceptedAt: '2026-07-18T04:39:00.000Z',
+        },
+        evidence: { listRuns: 'single-match' },
+      },
+    });
+    const before = await loadRunReconciliationState(
+      prepared.commandReceiptId,
+    );
+
+    await expect(repository.resolveRuntimeReconciliation({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      resolution: {
+        kind: 'adopt-session',
+        runtimeSession: {
+          externalSessionRef,
+          runtimeVersion: 'deterministic-v1',
+          replayStatus: 'complete',
+          historyDigest: 'sha256:parent-session',
+          metadata: { source: 'wrong-resolution-kind' },
+        },
+        evidence: { lookup: 'associated-session' },
+      },
+    })).rejects.toThrow(/Session|resource kind/i);
+
+    expect(
+      await loadRunReconciliationState(prepared.commandReceiptId),
+    ).toEqual(before);
+  });
+
   it('atomically attaches a known Runtime Session on the normal command path', async () => {
     const fixture = await bootstrapFixture();
     const session = await repository.createRootSession({
@@ -2385,6 +2612,177 @@ describe('PostgresControlPlaneRepository', () => {
       run_status: 'queued',
       run_error: null,
       run_completed: null,
+    });
+  });
+
+  it('atomically adopts a reconciled Runtime Run and replays concurrently', async () => {
+    const { fixture, prepared, externalRunRef } = await prepareRuntimeRun({
+      suffix: 'run-adopt',
+      attachRun: false,
+    });
+    const acceptedAt = '2026-07-18T04:40:00.000Z';
+    const evidence = { listRuns: 'single-match' };
+    await repository.markRuntimeCommandReconciling({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      externalResourceKind: 'run',
+      externalResourceRef: externalRunRef,
+      error: 'Run attach outcome unknown',
+    });
+    const input = {
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      resolution: {
+        kind: 'adopt-run' as const,
+        runtimeRun: { externalRunRef, acceptedAt },
+        evidence,
+      },
+    };
+
+    const [first, replay] = await Promise.all([
+      repository.resolveRuntimeReconciliation(input),
+      repository.resolveRuntimeReconciliation({ ...input }),
+    ]);
+
+    const expected = {
+      phase: 'attached',
+      outcome: 'adopted',
+      resource: {
+        kind: 'run',
+        runId: prepared.runId,
+        status: 'running',
+      },
+    };
+    expect(first).toEqual(expected);
+    expect(replay).toEqual(expected);
+
+    const states = await loadRunReconciliationState(prepared.commandReceiptId);
+    expect(states).toHaveLength(1);
+    const [state] = states;
+    expect(state).toMatchObject({
+      receipt_phase: 'attached',
+      receipt_kind: 'run',
+      receipt_ref: externalRunRef,
+      receipt_error: null,
+      run_ref: externalRunRef,
+      run_status: 'running',
+      run_error_code: null,
+      run_error_message: null,
+      run_completed_at: null,
+      compensation_status: 'succeeded',
+      compensation_attempts: 1,
+      compensation_ref: externalRunRef,
+      compensation_evidence: evidence,
+      compensation_error: null,
+    });
+    expect(state?.run_started_at?.toISOString()).toBe(acceptedAt);
+  });
+
+  it('rejects a conflicting attached Runtime Run replay without mutating state', async () => {
+    const { fixture, prepared, externalRunRef } = await prepareRuntimeRun({
+      suffix: 'run-adopt-conflict',
+      attachRun: false,
+    });
+    await repository.markRuntimeCommandReconciling({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      externalResourceKind: 'run',
+      externalResourceRef: externalRunRef,
+      error: 'Run attach outcome unknown',
+    });
+    await repository.resolveRuntimeReconciliation({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      resolution: {
+        kind: 'adopt-run',
+        runtimeRun: {
+          externalRunRef,
+          acceptedAt: '2026-07-18T04:41:00.000Z',
+        },
+        evidence: { listRuns: 'single-match' },
+      },
+    });
+    const before = await loadRunReconciliationState(prepared.commandReceiptId);
+
+    await expect(repository.resolveRuntimeReconciliation({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      resolution: {
+        kind: 'adopt-run',
+        runtimeRun: {
+          externalRunRef: `${externalRunRef}:conflict`,
+          acceptedAt: '2026-07-18T04:42:00.000Z',
+        },
+        evidence: { listRuns: 'conflicting-match' },
+      },
+    })).rejects.toThrow(/conflict/i);
+
+    expect(await loadRunReconciliationState(prepared.commandReceiptId)).toEqual(before);
+  });
+
+  it('rolls back a reconciled Runtime Run attach when evidence serialization fails', async () => {
+    const { fixture, prepared, externalRunRef } = await prepareRuntimeRun({
+      suffix: 'run-adopt-rollback',
+      attachRun: false,
+    });
+    await repository.markRuntimeCommandReconciling({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      externalResourceKind: 'run',
+      externalResourceRef: externalRunRef,
+      error: 'Run attach outcome unknown',
+    });
+
+    await expect(repository.resolveRuntimeReconciliation({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      resolution: {
+        kind: 'adopt-run',
+        runtimeRun: {
+          externalRunRef,
+          acceptedAt: '2026-07-18T04:43:00.000Z',
+        },
+        evidence: { serializationFailure: 1n },
+      },
+    })).rejects.toThrow();
+
+    expect(await loadRunReconciliationState(prepared.commandReceiptId)).toEqual([{
+      receipt_phase: 'reconciling',
+      receipt_kind: 'run',
+      receipt_ref: externalRunRef,
+      receipt_error: 'Run attach outcome unknown',
+      run_ref: null,
+      run_status: 'reconciling',
+      run_started_at: null,
+      run_error_code: null,
+      run_error_message: 'Run attach outcome unknown',
+      run_completed_at: null,
+      compensation_status: 'pending',
+      compensation_attempts: 0,
+      compensation_ref: externalRunRef,
+      compensation_evidence: {},
+      compensation_error: 'Run attach outcome unknown',
+    }]);
+
+    await expect(repository.resolveRuntimeReconciliation({
+      actor: fixture.actor,
+      commandReceiptId: prepared.commandReceiptId,
+      resolution: {
+        kind: 'adopt-run',
+        runtimeRun: {
+          externalRunRef,
+          acceptedAt: '2026-07-18T04:43:00.000Z',
+        },
+        evidence: { listRuns: 'single-match-after-rollback' },
+      },
+    })).resolves.toEqual({
+      phase: 'attached',
+      outcome: 'adopted',
+      resource: {
+        kind: 'run',
+        runId: prepared.runId,
+        status: 'running',
+      },
     });
   });
 

@@ -10,6 +10,7 @@ import type {
   PreparedRun,
   RunRuntimeContext,
   RuntimeRunAttachment,
+  StoredRunStatus,
   StoredSessionSnapshot,
   StoredRunEvent,
 } from './control-plane-run-types';
@@ -252,6 +253,11 @@ export type RuntimeReconciliationResolution =
       evidence: Record<string, unknown>;
     }
   | {
+      kind: 'adopt-run';
+      runtimeRun: RuntimeRunAttachment;
+      evidence: Record<string, unknown>;
+    }
+  | {
       kind: 'absent';
       evidence: Record<string, unknown>;
     }
@@ -267,10 +273,29 @@ export interface ResolveRuntimeReconciliationInput {
   resolution: RuntimeReconciliationResolution;
 }
 
-export interface RuntimeReconciliationResult {
-  phase: OrchestrationPhase;
-  outcome: 'adopted' | 'absent' | 'unresolved';
-}
+export type RuntimeReconciliationResult =
+  | {
+      phase: 'attached';
+      outcome: 'adopted';
+      resource:
+        | {
+            kind: 'session';
+            sessionId: string;
+          }
+        | {
+            kind: 'run';
+            runId: string;
+            status: StoredRunStatus;
+          };
+    }
+  | {
+      phase: 'retryable_failure';
+      outcome: 'absent';
+    }
+  | {
+      phase: 'reconciling';
+      outcome: 'unresolved';
+    };
 
 export interface SessionRuntimeContext {
   sessionId: string;
