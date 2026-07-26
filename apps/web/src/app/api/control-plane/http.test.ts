@@ -23,7 +23,10 @@ import {
 const request = (body: string) => new Request('http://localhost', { body, method: 'POST' });
 
 async function responseBody(response: Response) {
-  return response.json() as Promise<{ error?: { code: string; message: string; retryable: boolean }; receipt?: { commandReceiptId: string } }>;
+  return response.json() as Promise<{
+    error?: { code: string; message: string; retryable: boolean };
+    commandReceiptId?: string;
+  }>;
 }
 
 describe('control-plane HTTP boundary', () => {
@@ -82,30 +85,59 @@ describe('control-plane HTTP boundary', () => {
     ['runtime_session_unavailable', false, 409, undefined],
     ['runtime_operation_failed', true, 500, undefined],
   ] as const)('maps application error %s with its stable retryability', async (code, retryable, status, receiptId) => {
-    const response = errorResponse(new ControlPlaneApplicationError(code, 'sensitive detail', retryable, receiptId));
+    const response = errorResponse(new ControlPlaneApplicationError(code, 'safe application message', retryable, receiptId));
     const body = await responseBody(response);
 
     expect(response.status).toBe(status);
     expect(body.error).toEqual({
       code,
-      message: code === 'runtime_session_unavailable' ? 'Runtime session is unavailable' : code === 'runtime_operation_failed' ? 'Runtime operation failed' : 'Command accepted for asynchronous reconciliation',
+      message: 'safe application message',
       retryable,
     });
     if (status === 202) {
       expect(response.headers.get('retry-after')).toBe('2');
-      expect(body.receipt).toEqual({ commandReceiptId: 'receipt-1' });
+      expect(body.commandReceiptId).toBe('receipt-1');
     }
   });
 
+  it('omits commandReceiptId from an accepted response when none is available', async () => {
+    const response = errorResponse(
+      new ControlPlaneApplicationError(
+        'command_requires_reconciliation',
+        'safe application message',
+        true,
+      ),
+    );
+    const body = await responseBody(response);
+
+    expect(response.status).toBe(202);
+    expect(body).not.toHaveProperty('commandReceiptId');
+  });
+
   it('does not leak unexpected errors and logs only their name', async () => {
-    const logger = vi.fn();
+    const logger = { error: vi.fn() };
     const response = errorResponse(new Error('database password is secret'), logger);
 
     expect(response.status).toBe(500);
     expect(await responseBody(response)).toEqual({
       error: { code: 'internal_error', message: 'An unexpected error occurred', retryable: false },
     });
-    expect(logger).toHaveBeenCalledExactlyOnceWith('control_plane_request_failed', { errorName: 'Error' });
+    expect(logger.error).toHaveBeenCalledExactlyOnceWith('control_plane_request_failed', { errorName: 'Error' });
+  });
+
+  it('uses the default logger without leaking the unexpected error', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      errorResponse(new Error('database password is secret'));
+
+      expect(consoleError).toHaveBeenCalledExactlyOnceWith(
+        'control_plane_request_failed',
+        { errorName: 'Error' },
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it('accepts only UUID values', () => {
@@ -114,10 +146,12 @@ describe('control-plane HTTP boundary', () => {
   });
 
   it('accepts only non-negative safe integer pagination offsets', () => {
-    expect(parseAfter(undefined)).toBe(0);
-    expect(parseAfter('12')).toBe(12);
+    expect(parseAfter(new Request('http://localhost'))).toBe(0);
+    expect(parseAfter(new Request('http://localhost?after=12'))).toBe(12);
     for (const value of ['-1', '1.5', '9007199254740992', 'abc']) {
-      expect(() => parseAfter(value)).toThrow(new HttpError(400, 'invalid_request', 'Request validation failed'));
+      expect(() => parseAfter(new Request(`http://localhost?after=${value}`))).toThrow(
+        new HttpError(400, 'invalid_request', 'Request validation failed'),
+      );
     }
   });
 

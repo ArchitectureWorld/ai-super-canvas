@@ -22,10 +22,15 @@ export class HttpError extends Error {
   }
 }
 
-export type SafeErrorLogger = (
-  event: 'control_plane_request_failed',
-  context: { errorName: string },
-) => void;
+export interface SafeErrorLogger {
+  error(event: string, context: { errorName: string }): void;
+}
+
+const defaultLogger: SafeErrorLogger = {
+  error(event, context) {
+    console.error(event, context);
+  },
+};
 
 const invalidRequest = () =>
   new HttpError(400, 'invalid_request', 'Request validation failed');
@@ -59,8 +64,8 @@ export function parseUuid(value: string): string {
   return value;
 }
 
-export function parseAfter(value: string | null | undefined): number {
-  if (value === undefined || value === null) return 0;
+export function parseAfter(request: Request): number {
+  const value = new URL(request.url).searchParams.get('after') ?? '0';
   if (!/^\d+$/.test(value)) throw invalidRequest();
 
   const parsed = Number(value);
@@ -89,7 +94,10 @@ function conflictResponse(code: string): Response {
   );
 }
 
-export function errorResponse(reason: unknown, logger?: SafeErrorLogger): Response {
+export function errorResponse(
+  reason: unknown,
+  logger: SafeErrorLogger = defaultLogger,
+): Response {
   if (reason instanceof HttpError) {
     return noStoreJson(errorBody(reason.code, reason.message, reason.retryable), {
       status: reason.status,
@@ -121,10 +129,12 @@ export function errorResponse(reason: unknown, logger?: SafeErrorLogger): Respon
         {
           ...errorBody(
             reason.code,
-            'Command accepted for asynchronous reconciliation',
+            reason.message,
             reason.retryable,
           ),
-          receipt: { commandReceiptId: reason.commandReceiptId },
+          ...(reason.commandReceiptId === undefined
+            ? {}
+            : { commandReceiptId: reason.commandReceiptId }),
         },
         { status: 202, headers: { 'Retry-After': '2' } },
       );
@@ -132,19 +142,19 @@ export function errorResponse(reason: unknown, logger?: SafeErrorLogger): Respon
 
     if (reason.code === 'runtime_session_unavailable') {
       return noStoreJson(
-        errorBody(reason.code, 'Runtime session is unavailable', reason.retryable),
+        errorBody(reason.code, reason.message, reason.retryable),
         { status: 409 },
       );
     }
 
     return noStoreJson(
-      errorBody(reason.code, 'Runtime operation failed', reason.retryable),
+      errorBody(reason.code, reason.message, reason.retryable),
       { status: 500 },
     );
   }
 
   const errorName = reason instanceof Error ? reason.name : 'UnknownError';
-  logger?.('control_plane_request_failed', { errorName });
+  logger.error('control_plane_request_failed', { errorName });
   return noStoreJson(
     errorBody('internal_error', 'An unexpected error occurred'),
     { status: 500 },
