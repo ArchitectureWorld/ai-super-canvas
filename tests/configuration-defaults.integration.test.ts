@@ -108,7 +108,7 @@ describe('documented local-alpha model defaults', () => {
       },
       context: [],
     })).resolves.toMatchObject({
-      externalRunRef: 'fake-run-1',
+      externalRunRef: expect.stringMatching(/^fake-run-[0-9a-f]{24}$/),
       acceptedAt: '1970-01-01T00:00:00.000Z',
     });
   });

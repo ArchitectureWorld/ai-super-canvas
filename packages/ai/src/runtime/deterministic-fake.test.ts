@@ -1268,6 +1268,49 @@ describe('DeterministicFakeRuntime contract', () => {
     await verifyClaimedCapabilities(createFakeHarness);
   });
 
+  it('keeps external references unique across fresh Runtime instances', async () => {
+    const beforeRestart = new DeterministicFakeRuntime();
+    const afterRestart = new DeterministicFakeRuntime();
+    const sameResourceAfterRestart = new DeterministicFakeRuntime();
+
+    const beforeSession = await create(beforeRestart, 'before-restart');
+    const afterSession = await create(afterRestart, 'after-restart');
+    const restoredSession = await create(
+      sameResourceAfterRestart,
+      'before-restart',
+    );
+    expect(beforeSession.externalSessionRef).not.toBe(afterSession.externalSessionRef);
+    expect(restoredSession.externalSessionRef).toBe(
+      beforeSession.externalSessionRef,
+    );
+    expect(beforeSession.externalSessionRef).toMatch(
+      /^fake-session-[0-9a-f]{24}$/,
+    );
+    expect(afterSession.externalSessionRef).toMatch(
+      /^fake-session-[0-9a-f]{24}$/,
+    );
+
+    const beforeRun = await start(
+      beforeRestart,
+      beforeSession,
+      'before-restart',
+    );
+    const afterRun = await start(
+      afterRestart,
+      afterSession,
+      'after-restart',
+    );
+    const restoredRun = await start(
+      sameResourceAfterRestart,
+      restoredSession,
+      'before-restart',
+    );
+    expect(beforeRun.externalRunRef).not.toBe(afterRun.externalRunRef);
+    expect(restoredRun.externalRunRef).toBe(beforeRun.externalRunRef);
+    expect(beforeRun.externalRunRef).toMatch(/^fake-run-[0-9a-f]{24}$/);
+    expect(afterRun.externalRunRef).toMatch(/^fake-run-[0-9a-f]{24}$/);
+  });
+
   it('isolates both binding dimensions and returns deep-cloned session data', async () => {
     const runtime = new DeterministicFakeRuntime();
     const context = [{
