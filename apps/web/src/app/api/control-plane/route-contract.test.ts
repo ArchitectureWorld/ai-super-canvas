@@ -1,5 +1,9 @@
 import { ControlPlaneApplicationError } from '@ai-super-canvas/control-plane';
 import {
+  getControlPlane,
+  getLocalActorContext,
+} from '@/server/control-plane';
+import {
   ActiveRunConflictError,
   AuthorizationError,
   CommandPayloadConflictError,
@@ -15,6 +19,14 @@ import {
   makeStartRunHandler,
   makeTranscriptHandler,
 } from './handlers';
+import { GET as getRunEventsRoute } from './runs/[runId]/events/route';
+import { POST as postStartRunRoute } from './sessions/[sessionId]/runs/route';
+import { GET as getTranscriptRoute } from './sessions/[sessionId]/transcript/route';
+
+vi.mock('@/server/control-plane', () => ({
+  getControlPlane: vi.fn(),
+  getLocalActorContext: vi.fn(),
+}));
 
 const commandId = '550e8400-e29b-41d4-a716-446655440000';
 const workflowId = '550e8400-e29b-41d4-a716-446655440001';
@@ -25,6 +37,8 @@ const actor: ActorContext = {
   accountId: '550e8400-e29b-41d4-a716-446655440003',
   authSubject: 'local:owner',
 };
+const controlPlaneLoader = vi.mocked(getControlPlane);
+const actorLoader = vi.mocked(getLocalActorContext);
 
 function jsonRequest(body: unknown): Request {
   return new Request('http://canvas.test/api/control-plane', {
@@ -441,6 +455,77 @@ describe('persisted Run and transcript route contracts', () => {
     await expect(response.json()).resolves.toEqual({
       error: { code, message: reason.message === 'reconcile' || reason.message === 'unconfirmed' || reason.message === 'unavailable' ? reason.message : 'Request conflicts with the current server state', retryable: status === 202 },
       ...(receipt ? { commandReceiptId: receipt } : {}),
+    });
+  });
+});
+
+describe('persisted Run Route composition contracts', () => {
+  it('rejects invalid start Run params before starting either composition loader', async () => {
+    controlPlaneLoader.mockReset().mockRejectedValue(new Error('must not load'));
+    actorLoader.mockReset().mockRejectedValue(new Error('must not load'));
+
+    const response = await postStartRunRoute(
+      jsonRequest({ commandId, idempotencyKey: 'key', content: 'hello' }),
+      { params: Promise.resolve({ sessionId: 'not-a-uuid' }) },
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(controlPlaneLoader).not.toHaveBeenCalled();
+    expect(actorLoader).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid persisted events params before starting either composition loader', async () => {
+    controlPlaneLoader.mockReset().mockRejectedValue(new Error('must not load'));
+    actorLoader.mockReset().mockRejectedValue(new Error('must not load'));
+
+    const response = await getRunEventsRoute(
+      new Request('http://canvas.test/api/control-plane/runs'),
+      { params: Promise.resolve({ runId: 'not-a-uuid' }) },
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(controlPlaneLoader).not.toHaveBeenCalled();
+    expect(actorLoader).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid transcript params before starting either composition loader', async () => {
+    controlPlaneLoader.mockReset().mockRejectedValue(new Error('must not load'));
+    actorLoader.mockReset().mockRejectedValue(new Error('must not load'));
+
+    const response = await getTranscriptRoute(
+      new Request('http://canvas.test/api/control-plane/sessions/transcript'),
+      { params: Promise.resolve({ sessionId: 'not-a-uuid' }) },
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(controlPlaneLoader).not.toHaveBeenCalled();
+    expect(actorLoader).not.toHaveBeenCalled();
+  });
+
+  it('continues composition and reaches the start Run handler after valid Promise params', async () => {
+    const service = runService();
+    controlPlaneLoader.mockReset().mockResolvedValue({
+      service,
+    } as unknown as Awaited<ReturnType<typeof getControlPlane>>);
+    actorLoader.mockReset().mockResolvedValue(actor);
+
+    const response = await postStartRunRoute(
+      jsonRequest({ commandId, idempotencyKey: 'key', content: 'hello' }),
+      { params: Promise.resolve({ sessionId }) },
+    );
+
+    expect(response.status).toBe(202);
+    expect(controlPlaneLoader).toHaveBeenCalledExactlyOnceWith();
+    expect(actorLoader).toHaveBeenCalledExactlyOnceWith();
+    expect(service.startRun).toHaveBeenCalledExactlyOnceWith({
+      actor,
+      sessionId,
+      commandId,
+      idempotencyKey: 'key',
+      content: 'hello',
     });
   });
 });

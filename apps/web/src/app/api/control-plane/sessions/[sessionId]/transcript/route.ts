@@ -4,7 +4,7 @@ import {
 } from '@/server/control-plane';
 
 import { makeTranscriptHandler } from '../../../handlers';
-import { errorResponse } from '../../../http';
+import { errorResponse, parseUuid } from '../../../http';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,15 +14,16 @@ export async function GET(
   { params }: { params: Promise<{ sessionId: string }> },
 ): Promise<Response> {
   try {
-    const [{ sessionId }, controlPlane, actor] = await Promise.all([
-      params,
+    const { sessionId } = await params;
+    const validatedSessionId = parseUuid(sessionId);
+    const [controlPlane, actor] = await Promise.all([
       getControlPlane(),
       getLocalActorContext(),
     ]);
     return makeTranscriptHandler({
       service: controlPlane.service,
       actor,
-    })({ sessionId });
+    })({ sessionId: validatedSessionId });
   } catch (reason) {
     return errorResponse(reason);
   }

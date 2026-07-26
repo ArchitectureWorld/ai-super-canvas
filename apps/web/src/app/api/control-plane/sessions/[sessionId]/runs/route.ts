@@ -4,7 +4,7 @@ import {
 } from '@/server/control-plane';
 
 import { makeStartRunHandler } from '../../../handlers';
-import { errorResponse } from '../../../http';
+import { errorResponse, parseUuid } from '../../../http';
 
 export const runtime = 'nodejs';
 
@@ -13,15 +13,16 @@ export async function POST(
   { params }: { params: Promise<{ sessionId: string }> },
 ): Promise<Response> {
   try {
-    const [{ sessionId }, controlPlane, actor] = await Promise.all([
-      params,
+    const { sessionId } = await params;
+    const validatedSessionId = parseUuid(sessionId);
+    const [controlPlane, actor] = await Promise.all([
       getControlPlane(),
       getLocalActorContext(),
     ]);
     return makeStartRunHandler({
       service: controlPlane.service,
       actor,
-    })(request, { sessionId });
+    })(request, { sessionId: validatedSessionId });
   } catch (reason) {
     return errorResponse(reason);
   }
