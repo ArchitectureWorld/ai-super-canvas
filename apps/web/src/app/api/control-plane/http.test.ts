@@ -20,7 +20,17 @@ import {
   parseUuid,
 } from './http';
 
-const request = (body: string) => new Request('http://localhost', { body, method: 'POST' });
+const request = (body: string, headers?: HeadersInit) => new Request(
+  'http://localhost/api/control-plane',
+  {
+    body,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...headers,
+    },
+  },
+);
 
 async function responseBody(response: Response) {
   return response.json() as Promise<{
@@ -34,6 +44,57 @@ function expectNoStore(response: Response) {
 }
 
 describe('control-plane HTTP boundary', () => {
+  it('rejects a cross-site simple POST before parsing its valid JSON body', async () => {
+    const reason = await parseJson(
+      request(JSON.stringify({ name: 'forged' }), {
+        'Content-Type': 'text/plain',
+        Origin: 'https://attacker.example',
+      }),
+      z.object({ name: z.string() }),
+    ).catch((error: unknown) => error);
+    const response = errorResponse(reason);
+
+    expect(response.status).toBe(415);
+    expect(await responseBody(response)).toEqual({
+      error: {
+        code: 'unsupported_media_type',
+        message: 'Request body must use application/json',
+        retryable: false,
+      },
+    });
+    expectNoStore(response);
+  });
+
+  it('rejects a cross-origin JSON POST before parsing its valid body', async () => {
+    const reason = await parseJson(
+      request(JSON.stringify({ name: 'forged' }), {
+        Origin: 'https://attacker.example',
+      }),
+      z.object({ name: z.string() }),
+    ).catch((error: unknown) => error);
+    const response = errorResponse(reason);
+
+    expect(response.status).toBe(403);
+    expect(await responseBody(response)).toEqual({
+      error: {
+        code: 'forbidden_origin',
+        message: 'Cross-origin requests are not allowed',
+        retryable: false,
+      },
+    });
+    expectNoStore(response);
+  });
+
+  it.each([
+    ['same-origin browser request', { Origin: 'http://localhost' }],
+    ['non-browser request without Origin', undefined],
+  ])('accepts JSON from a %s', async (_description, headers) => {
+    await expect(parseJson(
+      request(JSON.stringify({ name: 'local' }), headers),
+      z.object({ name: z.string() }),
+    )).resolves.toEqual({ name: 'local' });
+  });
+
   it('maps malformed JSON to a sanitized no-store 400 response', async () => {
     const reason = await parseJson(request('{'), z.object({ name: z.string() })).catch(
       (error: unknown) => error,

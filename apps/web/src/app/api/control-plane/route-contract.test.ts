@@ -177,6 +177,37 @@ describe('persisted Session write route contracts', () => {
     expect(service.bootstrapLocalAlpha).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [
+      'a cross-site text/plain simple request',
+      { 'Content-Type': 'text/plain', Origin: 'https://attacker.example' },
+      415,
+    ],
+    [
+      'a cross-origin application/json request',
+      { 'Content-Type': 'application/json', Origin: 'https://attacker.example' },
+      403,
+    ],
+  ])('rejects %s before calling the bootstrap service', async (
+    _description,
+    headers,
+    expectedStatus,
+  ) => {
+    const service = bootstrapService();
+    const response = await makeBootstrapHandler({
+      service,
+      authSubject: actor.authSubject,
+    })(new Request('http://canvas.test/api/control-plane/bootstrap', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ commandId }),
+    }));
+
+    expect(response.status).toBe(expectedStatus);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(service.bootstrapLocalAlpha).not.toHaveBeenCalled();
+  });
+
   it('creates a root Session using only its injected actor context', async () => {
     const service = sessionService();
     const handler = makeCreateSessionHandler({ service, actor });
@@ -371,7 +402,11 @@ describe('persisted Run and transcript route contracts', () => {
   ])('rejects start Run request with %s before calling the service', async (_description, body, rawBody) => {
     const service = runService();
     const request = rawBody
-      ? new Request('http://canvas.test/api/control-plane', { method: 'POST', body: rawBody })
+      ? new Request('http://canvas.test/api/control-plane', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: rawBody,
+        })
       : jsonRequest(body);
     const response = await makeStartRunHandler({ service, actor })(request, { sessionId });
 

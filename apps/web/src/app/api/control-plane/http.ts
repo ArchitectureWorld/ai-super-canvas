@@ -35,10 +35,49 @@ const defaultLogger: SafeErrorLogger = {
 const invalidRequest = () =>
   new HttpError(400, 'invalid_request', 'Request validation failed');
 
+function assertTrustedJsonRequest(request: Request): void {
+  const mediaType = request.headers
+    .get('content-type')
+    ?.split(';', 1)[0]
+    ?.trim()
+    .toLowerCase();
+  if (mediaType !== 'application/json') {
+    throw new HttpError(
+      415,
+      'unsupported_media_type',
+      'Request body must use application/json',
+    );
+  }
+
+  const origin = request.headers.get('origin');
+  if (!origin) return;
+
+  let parsedOrigin: string;
+  try {
+    parsedOrigin = new URL(origin).origin;
+  } catch {
+    throw new HttpError(
+      403,
+      'forbidden_origin',
+      'Cross-origin requests are not allowed',
+    );
+  }
+
+  if (parsedOrigin !== new URL(request.url).origin) {
+    throw new HttpError(
+      403,
+      'forbidden_origin',
+      'Cross-origin requests are not allowed',
+    );
+  }
+}
+
 export async function parseJson<T extends z.ZodType>(
   request: Request,
   schema: T,
 ): Promise<z.output<T>> {
+  assertTrustedJsonRequest(request);
+
   let body: unknown;
 
   try {
