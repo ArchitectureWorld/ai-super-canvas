@@ -35,6 +35,9 @@ const defaultLogger: SafeErrorLogger = {
 const invalidRequest = () =>
   new HttpError(400, 'invalid_request', 'Request validation failed');
 
+const loopbackAuthorityPattern =
+  /^(?:(?:localhost|127\.0\.0\.1)(?::\d{1,5})?|\[::1\](?::\d{1,5})?)$/i;
+
 function assertTrustedJsonRequest(request: Request): void {
   const mediaType = request.headers
     .get('content-type')
@@ -53,8 +56,20 @@ function assertTrustedJsonRequest(request: Request): void {
   if (!origin) return;
 
   let parsedOrigin: string;
+  let requestOrigin: string;
   try {
     parsedOrigin = new URL(origin).origin;
+    const requestUrl = new URL(request.url);
+    const authority = request.headers.get('host') ?? requestUrl.host;
+    if (
+      !loopbackAuthorityPattern.test(authority)
+      || (requestUrl.protocol !== 'http:' && requestUrl.protocol !== 'https:')
+    ) {
+      throw new Error('Untrusted request authority');
+    }
+    requestOrigin = new URL(
+      `${requestUrl.protocol}//${authority}`,
+    ).origin;
   } catch {
     throw new HttpError(
       403,
@@ -63,7 +78,7 @@ function assertTrustedJsonRequest(request: Request): void {
     );
   }
 
-  if (parsedOrigin !== new URL(request.url).origin) {
+  if (parsedOrigin !== requestOrigin) {
     throw new HttpError(
       403,
       'forbidden_origin',

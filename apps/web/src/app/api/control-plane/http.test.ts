@@ -95,6 +95,60 @@ describe('control-plane HTTP boundary', () => {
     )).resolves.toEqual({ name: 'local' });
   });
 
+  it('accepts a browser Origin matching Host when the internal URL is canonicalized', async () => {
+    const canonicalizedRequest = new Request(
+      'http://localhost:3000/api/control-plane',
+      {
+        body: JSON.stringify({ name: 'local' }),
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Host: '127.0.0.1:3000',
+          Origin: 'http://127.0.0.1:3000',
+        },
+      },
+    );
+
+    await expect(parseJson(
+      canonicalizedRequest,
+      z.object({ name: z.string() }),
+    )).resolves.toEqual({ name: 'local' });
+  });
+
+  it.each([
+    [
+      'a cross-site Origin targeting a loopback Host',
+      '127.0.0.1:3000',
+      'https://attacker.example',
+    ],
+    [
+      'a DNS-rebinding authority even when Host and Origin match',
+      'attacker.example:3000',
+      'http://attacker.example:3000',
+    ],
+  ])('rejects %s', async (_description, host, origin) => {
+    const untrustedRequest = new Request(
+      'http://localhost:3000/api/control-plane',
+      {
+        body: JSON.stringify({ name: 'forged' }),
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Host: host,
+          Origin: origin,
+        },
+      },
+    );
+
+    await expect(parseJson(
+      untrustedRequest,
+      z.object({ name: z.string() }),
+    )).rejects.toMatchObject({
+      status: 403,
+      code: 'forbidden_origin',
+    });
+  });
+
   it('maps malformed JSON to a sanitized no-store 400 response', async () => {
     const reason = await parseJson(request('{'), z.object({ name: z.string() })).catch(
       (error: unknown) => error,
