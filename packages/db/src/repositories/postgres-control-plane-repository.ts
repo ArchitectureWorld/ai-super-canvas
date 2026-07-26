@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import type { ActorContext } from '@ai-super-canvas/core';
 import postgres from 'postgres';
+import { z } from 'zod';
 
 import {
   AuthorizationError,
@@ -59,6 +60,8 @@ interface CanonicalPayload {
   hash: string;
   text: string;
 }
+
+const runtimeRunAcceptedAtSchema = z.iso.datetime({ offset: true });
 
 interface BootstrapReceiptRow {
   auth_subject: string;
@@ -1514,9 +1517,37 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     runtimeSession: RuntimeSessionAttachment,
     evidence: Record<string, unknown>,
   ): Promise<void> {
-    if (receipt.orchestration_phase === 'attached') return;
     if (receipt.result_type !== 'session') {
       throw new Error('Command receipt does not describe a Session');
+    }
+    if (receipt.orchestration_phase === 'attached') {
+      if (
+        receipt.external_resource_kind !== 'session'
+        || receipt.external_resource_ref !== runtimeSession.externalSessionRef
+      ) {
+        throw new Error('Runtime Session reference conflicts with attached receipt');
+      }
+      const [attachedRef] = await tx<{
+        external_session_ref: string;
+        agent_binding_id: string;
+      }[]>`
+        SELECT external_session_ref, agent_binding_id
+        FROM session_runtime_refs
+        WHERE session_id = ${receipt.session_id}
+          AND is_primary = true
+          AND status = 'active'
+        FOR UPDATE
+      `;
+      if (
+        !attachedRef
+        || attachedRef.external_session_ref !== runtimeSession.externalSessionRef
+        || attachedRef.agent_binding_id !== receipt.agent_binding_id
+      ) {
+        throw new Error(
+          'Runtime Session reference conflicts with active primary Runtime reference',
+        );
+      }
+      return;
     }
     if (!['runtime_known', 'reconciling'].includes(receipt.orchestration_phase)) {
       throw new Error(`Runtime Session cannot attach from ${receipt.orchestration_phase}`);
@@ -1631,6 +1662,151 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         last_error = NULL, completed_at = COALESCE(completed_at, now())
       WHERE id = ${receipt.id}
     `;
+  }
+
+  private async attachRuntimeRunInTransaction(
+    tx: postgres.TransactionSql,
+    receipt: ReceiptAuthorizationRow,
+    runtimeRun: RuntimeRunAttachment,
+    evidence: Record<string, unknown>,
+  ): Promise<{ runId: string; status: StoredRunStatus }> {
+    if (receipt.result_type !== 'run' || receipt.run_id === null) {
+      throw new Error('Command receipt does not describe a Run');
+    }
+    if (!runtimeRun.externalRunRef.trim()) {
+      throw new Error('Runtime Run reference must not be empty');
+    }
+    const acceptedAtResult = runtimeRunAcceptedAtSchema.safeParse(
+      runtimeRun.acceptedAt,
+    );
+    if (!acceptedAtResult.success) {
+      throw new Error('Runtime Run acceptedAt must be an ISO timestamp');
+    }
+    const acceptedAt = new Date(acceptedAtResult.data);
+
+    const [run] = await tx<{
+      runtime_run_ref: string | null;
+      status: StoredRunStatus;
+    }[]>`
+      SELECT runtime_run_ref, status::text AS status
+      FROM runs
+      WHERE id = ${receipt.run_id}
+      FOR UPDATE
+    `;
+    if (!run) throw new AuthorizationError();
+    if (
+      run.runtime_run_ref !== null
+      && run.runtime_run_ref !== runtimeRun.externalRunRef
+    ) {
+      throw new Error('Runtime Run reference conflicts with attached Run');
+    }
+    if (receipt.orchestration_phase === 'attached') {
+      if (
+        receipt.external_resource_kind !== 'run'
+        || receipt.external_resource_ref !== runtimeRun.externalRunRef
+        || run.runtime_run_ref !== runtimeRun.externalRunRef
+      ) {
+        throw new Error('Runtime Run reference conflicts with attached receipt');
+      }
+      return { runId: receipt.run_id, status: run.status };
+    }
+    if (!['runtime_known', 'reconciling'].includes(receipt.orchestration_phase)) {
+      throw new Error(`Runtime Run cannot attach from ${receipt.orchestration_phase}`);
+    }
+    if (
+      receipt.external_resource_kind !== null
+      && receipt.external_resource_kind !== 'run'
+    ) {
+      throw new Error('Runtime resource kind conflicts with Run attach');
+    }
+    if (
+      receipt.external_resource_ref !== null
+      && receipt.external_resource_ref !== runtimeRun.externalRunRef
+    ) {
+      throw new Error('Runtime Run reference conflicts with recorded resource');
+    }
+
+    const [updatedRun] = await tx<{
+      id: string;
+      status: StoredRunStatus;
+    }[]>`
+      UPDATE runs
+      SET runtime_run_ref = COALESCE(runtime_run_ref, ${runtimeRun.externalRunRef}),
+        status = CASE
+          WHEN status IN ('queued', 'reconciling') THEN 'running'::run_status
+          ELSE status
+        END,
+        started_at = COALESCE(started_at, ${acceptedAt}),
+        error_code = CASE
+          WHEN status IN ('queued', 'reconciling') THEN NULL
+          ELSE error_code
+        END,
+        error_message = CASE
+          WHEN status IN ('queued', 'reconciling') THEN NULL
+          ELSE error_message
+        END,
+        completed_at = CASE
+          WHEN status IN ('queued', 'reconciling') THEN NULL
+          ELSE completed_at
+        END
+      WHERE id = ${receipt.run_id}
+        AND (runtime_run_ref IS NULL OR runtime_run_ref = ${runtimeRun.externalRunRef})
+      RETURNING id, status::text AS status
+    `;
+    if (!updatedRun) {
+      throw new Error('Runtime Run could not be attached');
+    }
+
+    const [updatedReceipt] = await tx<{ id: string }[]>`
+      UPDATE command_receipts
+      SET orchestration_phase = 'attached', external_resource_kind = 'run',
+        external_resource_ref = ${runtimeRun.externalRunRef},
+        last_error = NULL, completed_at = COALESCE(completed_at, now())
+      WHERE id = ${receipt.id}
+      RETURNING id
+    `;
+    if (!updatedReceipt) {
+      throw new Error('Runtime Run receipt could not be attached');
+    }
+
+    const [compensation] = await tx<CompensationRow[]>`
+      SELECT id, status, attempts, external_resource_ref,
+        resolution_evidence, last_error
+      FROM runtime_compensations
+      WHERE command_receipt_id = ${receipt.id}
+        AND external_resource_kind = 'run'
+        AND action = 'adopt'
+        AND status <> 'succeeded'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+      FOR UPDATE
+    `;
+    if (!compensation) {
+      throw new Error('Runtime Run attach has no durable compensation record');
+    }
+    if (
+      compensation.external_resource_ref !== null
+      && compensation.external_resource_ref !== runtimeRun.externalRunRef
+    ) {
+      throw new Error('Runtime Run reference conflicts with compensation record');
+    }
+    const [updatedCompensation] = await tx<{ id: string }[]>`
+      UPDATE runtime_compensations
+      SET external_resource_ref = COALESCE(
+            external_resource_ref, ${runtimeRun.externalRunRef}
+          ),
+        status = 'succeeded', attempts = attempts + 1, last_error = NULL,
+        resolution_evidence = ${tx.json(evidence as postgres.JSONValue)},
+        resolved_at = now(), updated_at = now()
+      WHERE id = ${compensation.id}
+        AND status <> 'succeeded'
+      RETURNING id
+    `;
+    if (!updatedCompensation) {
+      throw new Error('Runtime Run compensation could not be resolved');
+    }
+
+    return { runId: updatedRun.id, status: updatedRun.status };
   }
 
   async bootstrapLocalAlpha(
@@ -2754,96 +2930,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         input.actor,
         input.commandReceiptId,
       );
-      if (receipt.result_type !== 'run' || receipt.run_id === null) {
-        throw new Error('Command receipt does not describe a Run');
-      }
-      if (!input.runtimeRun.externalRunRef.trim()) {
-        throw new Error('Runtime Run reference must not be empty');
-      }
-      const acceptedAt = new Date(input.runtimeRun.acceptedAt);
-      if (Number.isNaN(acceptedAt.getTime())) {
-        throw new Error('Runtime Run acceptedAt must be an ISO timestamp');
-      }
-
-      const [run] = await tx<{
-        runtime_run_ref: string | null;
-      }[]>`
-        SELECT runtime_run_ref
-        FROM runs
-        WHERE id = ${receipt.run_id}
-        FOR UPDATE
-      `;
-      if (!run) throw new AuthorizationError();
-      if (
-        run.runtime_run_ref !== null
-        && run.runtime_run_ref !== input.runtimeRun.externalRunRef
-      ) {
-        throw new Error('Runtime Run reference conflicts with attached Run');
-      }
-      if (receipt.orchestration_phase === 'attached') {
-        if (
-          receipt.external_resource_kind !== 'run'
-          || receipt.external_resource_ref !== input.runtimeRun.externalRunRef
-          || run.runtime_run_ref !== input.runtimeRun.externalRunRef
-        ) {
-          throw new Error('Runtime Run reference conflicts with attached receipt');
-        }
-        return;
-      }
-      if (!['runtime_known', 'reconciling'].includes(receipt.orchestration_phase)) {
-        throw new Error(`Runtime Run cannot attach from ${receipt.orchestration_phase}`);
-      }
-      if (
-        receipt.external_resource_kind !== null
-        && receipt.external_resource_kind !== 'run'
-      ) {
-        throw new Error('Runtime resource kind conflicts with Run attach');
-      }
-      if (
-        receipt.external_resource_ref !== null
-        && receipt.external_resource_ref !== input.runtimeRun.externalRunRef
-      ) {
-        throw new Error('Runtime Run reference conflicts with recorded resource');
-      }
-
-      const [updatedRun] = await tx<{ id: string }[]>`
-        UPDATE runs
-        SET runtime_run_ref = COALESCE(runtime_run_ref, ${input.runtimeRun.externalRunRef}),
-          status = CASE WHEN status = 'queued' THEN 'running'::run_status ELSE status END,
-          started_at = COALESCE(started_at, ${acceptedAt}),
-          error_code = CASE WHEN status = 'queued' THEN NULL ELSE error_code END,
-          error_message = CASE WHEN status = 'queued' THEN NULL ELSE error_message END,
-          completed_at = CASE WHEN status = 'queued' THEN NULL ELSE completed_at END
-        WHERE id = ${receipt.run_id}
-          AND (runtime_run_ref IS NULL OR runtime_run_ref = ${input.runtimeRun.externalRunRef})
-        RETURNING id
-      `;
-      if (!updatedRun) {
-        throw new Error('Runtime Run could not be attached');
-      }
-      await tx`
-        UPDATE command_receipts
-        SET orchestration_phase = 'attached', external_resource_kind = 'run',
-          external_resource_ref = ${input.runtimeRun.externalRunRef},
-          last_error = NULL, completed_at = now()
-        WHERE id = ${receipt.id}
-      `;
-      await tx`
-        UPDATE runtime_compensations
-        SET external_resource_ref = COALESCE(
-              external_resource_ref, ${input.runtimeRun.externalRunRef}
-            ),
-          status = 'succeeded', attempts = attempts + 1, last_error = NULL,
-          resolution_evidence = ${tx.json({
-            outcome: 'adopted',
-            path: 'normal-command',
-            externalRunRef: input.runtimeRun.externalRunRef,
-          })},
-          resolved_at = now(), updated_at = now()
-        WHERE command_receipt_id = ${receipt.id}
-          AND external_resource_kind = 'run' AND action = 'adopt'
-          AND status <> 'succeeded'
-      `;
+      await this.attachRuntimeRunInTransaction(tx, receipt, input.runtimeRun, {
+        outcome: 'adopted',
+        path: 'normal-command',
+        externalRunRef: input.runtimeRun.externalRunRef,
+      });
     });
   }
 
@@ -3021,6 +3112,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async syncRuntimeSessionHistory(input: {
     actor: ActorContext;
     sessionId: string;
+    externalSessionRef: string;
     historyDigest: string;
   }): Promise<void> {
     await this.sql.begin(async (tx) => {
@@ -3030,11 +3122,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         SET metadata = metadata || ${tx.json({ historyDigest: input.historyDigest })},
           updated_at = now()
         WHERE session_id = ${input.sessionId}
+          AND external_session_ref = ${input.externalSessionRef}
           AND is_primary = true AND status = 'active'
         RETURNING id
       `;
       if (!runtimeRef) {
-        throw new Error('Session has no active primary Runtime reference');
+        throw new Error(
+          'Session active primary Runtime reference changed before history sync',
+        );
       }
     });
   }
@@ -3308,10 +3403,44 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         input.commandReceiptId,
       );
       if (receipt.orchestration_phase === 'attached') {
-        if (input.resolution.kind !== 'adopt-session') {
-          throw new Error('An attached Runtime resource cannot be resolved as absent');
+        if (input.resolution.kind === 'adopt-session') {
+          await this.attachRuntimeSessionInTransaction(
+            tx,
+            receipt,
+            input.resolution.runtimeSession,
+            Object.keys(input.resolution.evidence).length > 0
+              ? input.resolution.evidence
+              : { outcome: 'adopted' },
+          );
+          return {
+            phase: 'attached',
+            outcome: 'adopted',
+            resource: {
+              kind: 'session',
+              sessionId: receipt.session_id,
+            },
+          };
         }
-        return { phase: 'attached', outcome: 'adopted' };
+        if (input.resolution.kind === 'adopt-run') {
+          const attachedRun = await this.attachRuntimeRunInTransaction(
+            tx,
+            receipt,
+            input.resolution.runtimeRun,
+            Object.keys(input.resolution.evidence).length > 0
+              ? input.resolution.evidence
+              : { outcome: 'adopted' },
+          );
+          return {
+            phase: 'attached',
+            outcome: 'adopted',
+            resource: {
+              kind: 'run',
+              runId: attachedRun.runId,
+              status: attachedRun.status,
+            },
+          };
+        }
+        throw new Error('An attached Runtime resource requires an adoption resolution');
       }
       const [compensation] = await tx<CompensationRow[]>`
         SELECT id, status, attempts, external_resource_ref,
@@ -3348,7 +3477,33 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
             ? input.resolution.evidence
             : { outcome: 'adopted' },
         );
-        return { phase: 'attached', outcome: 'adopted' };
+        return {
+          phase: 'attached',
+          outcome: 'adopted',
+          resource: {
+            kind: 'session',
+            sessionId: receipt.session_id,
+          },
+        };
+      }
+      if (input.resolution.kind === 'adopt-run') {
+        const attachedRun = await this.attachRuntimeRunInTransaction(
+          tx,
+          receipt,
+          input.resolution.runtimeRun,
+          Object.keys(input.resolution.evidence).length > 0
+            ? input.resolution.evidence
+            : { outcome: 'adopted' },
+        );
+        return {
+          phase: 'attached',
+          outcome: 'adopted',
+          resource: {
+            kind: 'run',
+            runId: attachedRun.runId,
+            status: attachedRun.status,
+          },
+        };
       }
       if (input.resolution.kind === 'absent') {
         if (receipt.external_resource_ref !== null) {

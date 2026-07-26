@@ -114,9 +114,49 @@ describe('RunEventPump', () => {
     expect(harness.repository.syncRuntimeSessionHistory).toHaveBeenCalledWith({
       actor,
       sessionId: context.sessionId,
+      externalSessionRef: context.externalSessionRef,
       historyDigest: 'sha256:after-run',
     });
     expect(harness.repository.markRunReconciling).not.toHaveBeenCalled();
+  });
+
+  it('keeps the terminal event uncommitted when Runtime Session history CAS rejects', async () => {
+    const harness = createHarness(terminalEvents());
+    harness.repository.syncRuntimeSessionHistory.mockRejectedValueOnce(
+      new Error(
+        'Session active primary Runtime reference changed before history sync',
+      ),
+    );
+
+    harness.pump.start({ actor, runId: context.runId });
+    await harness.pump.waitForIdle(context.runId);
+
+    expect(harness.repository.ingestRuntimeEvent).toHaveBeenCalledOnce();
+    expect(harness.repository.ingestRuntimeEvent).toHaveBeenCalledWith({
+      actor,
+      runId: context.runId,
+      event: expect.objectContaining({
+        eventType: 'message.completed',
+      }),
+    });
+    expect(harness.repository.ingestRuntimeEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: expect.objectContaining({
+          eventType: 'run.completed',
+        }),
+      }),
+    );
+    expect(harness.repository.syncRuntimeSessionHistory).toHaveBeenCalledWith({
+      actor,
+      sessionId: context.sessionId,
+      externalSessionRef: context.externalSessionRef,
+      historyDigest: 'sha256:after-run',
+    });
+    expect(harness.repository.markRunReconciling).toHaveBeenCalledWith({
+      actor,
+      runId: context.runId,
+      error: 'runtime_event_pump_failed',
+    });
   });
 
   it('marks a Run reconciling when the stream ends without a terminal event', async () => {

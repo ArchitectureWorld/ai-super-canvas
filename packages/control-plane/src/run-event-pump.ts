@@ -171,6 +171,7 @@ export class RunEventPump implements RunEventPumpPort {
         await this.repository.syncRuntimeSessionHistory({
           actor: input.actor,
           sessionId: context.sessionId,
+          externalSessionRef: context.externalSessionRef,
           historyDigest: runtimeSession.historyDigest,
         });
       }

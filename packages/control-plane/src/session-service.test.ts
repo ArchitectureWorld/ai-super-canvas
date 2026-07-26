@@ -4,7 +4,11 @@ import {
   type RuntimeAdapter,
 } from '@ai-super-canvas/ai';
 import type { ActorContext } from '@ai-super-canvas/core';
-import type { ControlPlaneRepository } from '@ai-super-canvas/db';
+import type {
+  ControlPlaneRepository,
+  ResolveRuntimeReconciliationInput,
+  RuntimeReconciliationResult,
+} from '@ai-super-canvas/db';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ControlPlaneApplicationError } from './errors';
@@ -1368,6 +1372,195 @@ describe('SessionService Run start', () => {
     });
     expect(runtime.startRun).not.toHaveBeenCalled();
     expect(eventPump.start).toHaveBeenCalledOnce();
+  });
+});
+
+describe('SessionService Runtime reconciliation', () => {
+  const adoptedRunInput: ResolveRuntimeReconciliationInput = {
+    actor,
+    commandReceiptId: ids.receiptId,
+    resolution: {
+      kind: 'adopt-run',
+      runtimeRun: {
+        externalRunRef: 'fake-run-adopted',
+        acceptedAt: new Date(0).toISOString(),
+      },
+      evidence: { lookup: 'single-run-match' },
+    },
+  };
+  const adoptedSessionInput: ResolveRuntimeReconciliationInput = {
+    actor,
+    commandReceiptId: ids.receiptId,
+    resolution: {
+      kind: 'adopt-session',
+      runtimeSession: {
+        externalSessionRef: 'fake-session-adopted',
+        runtimeVersion: 'deterministic-v1',
+        replayStatus: 'complete',
+        historyDigest: 'sha256:adopted-session',
+        metadata: { lookup: 'single-session-match' },
+      },
+      evidence: { lookup: 'single-session-match' },
+    },
+  };
+  const runId = preparedRun().runId;
+
+  it.each([
+    'queued',
+    'running',
+    'waiting_approval',
+  ] as const)(
+    'waits for adopted Run %s persistence before starting its pump',
+    async (status) => {
+      const result: RuntimeReconciliationResult = {
+        phase: 'attached',
+        outcome: 'adopted',
+        resource: {
+          kind: 'run',
+          runId,
+          status,
+        },
+      };
+      let finishRepository!: () => void;
+      const repository = {
+        resolveRuntimeReconciliation: vi.fn().mockImplementation(
+          async () => {
+            await new Promise<void>((resolve) => {
+              finishRepository = resolve;
+            });
+            return result;
+          },
+        ),
+      };
+      const eventPump = {
+        start: vi.fn().mockReturnValue('started' as const),
+      };
+      const service = new SessionService(
+        repository as unknown as ControlPlaneRepository,
+        {} as RuntimeAdapter,
+        eventPump,
+      );
+
+      const pending = service.resolveRuntimeReconciliation(adoptedRunInput);
+      expect(repository.resolveRuntimeReconciliation)
+        .toHaveBeenCalledWith(adoptedRunInput);
+      expect(eventPump.start).not.toHaveBeenCalled();
+
+      finishRepository();
+      await expect(pending).resolves.toEqual(result);
+      expect(repository.resolveRuntimeReconciliation.mock.invocationCallOrder[0])
+        .toBeLessThan(eventPump.start.mock.invocationCallOrder[0]!);
+      expect(eventPump.start).toHaveBeenCalledOnce();
+      expect(eventPump.start).toHaveBeenCalledWith({ actor, runId });
+    },
+  );
+
+  const noPumpCases: Array<[
+    string,
+    ResolveRuntimeReconciliationInput,
+    RuntimeReconciliationResult,
+  ]> = [
+    [
+      'absent resolution',
+      {
+        actor,
+        commandReceiptId: ids.receiptId,
+        resolution: {
+          kind: 'absent',
+          evidence: { lookup: 'no-match' },
+        },
+      },
+      { phase: 'retryable_failure', outcome: 'absent' },
+    ],
+    [
+      'unresolved lookup',
+      {
+        actor,
+        commandReceiptId: ids.receiptId,
+        resolution: {
+          kind: 'unresolved',
+          error: 'Runtime lookup remains unresolved',
+          evidence: { lookup: 'pending' },
+        },
+      },
+      { phase: 'reconciling', outcome: 'unresolved' },
+    ],
+    [
+      'adopted Session',
+      adoptedSessionInput,
+      {
+        phase: 'attached',
+        outcome: 'adopted',
+        resource: {
+          kind: 'session',
+          sessionId: ids.sessionId,
+        },
+      },
+    ],
+    ...(['succeeded', 'failed', 'cancelled'] as const).map(
+      (status): [
+        string,
+        ResolveRuntimeReconciliationInput,
+        RuntimeReconciliationResult,
+      ] => [
+        `terminal Run ${status}`,
+        adoptedRunInput,
+        {
+          phase: 'attached',
+          outcome: 'adopted',
+          resource: {
+            kind: 'run',
+            runId,
+            status,
+          },
+        },
+      ],
+    ),
+  ];
+
+  it.each(noPumpCases)(
+    'does not start a pump for %s',
+    async (_name, input, result) => {
+      const repository = {
+        resolveRuntimeReconciliation: vi.fn().mockResolvedValue(result),
+      };
+      const eventPump = {
+        start: vi.fn().mockReturnValue('started' as const),
+      };
+      const service = new SessionService(
+        repository as unknown as ControlPlaneRepository,
+        {} as RuntimeAdapter,
+        eventPump,
+      );
+
+      await expect(
+        service.resolveRuntimeReconciliation(input),
+      ).resolves.toEqual(result);
+      expect(repository.resolveRuntimeReconciliation).toHaveBeenCalledWith(input);
+      expect(eventPump.start).not.toHaveBeenCalled();
+    },
+  );
+
+  it('propagates Repository rejection without starting a pump', async () => {
+    const persistenceFailure = new Error('reconciliation transaction rejected');
+    const repository = {
+      resolveRuntimeReconciliation: vi.fn().mockRejectedValue(
+        persistenceFailure,
+      ),
+    };
+    const eventPump = {
+      start: vi.fn().mockReturnValue('started' as const),
+    };
+    const service = new SessionService(
+      repository as unknown as ControlPlaneRepository,
+      {} as RuntimeAdapter,
+      eventPump,
+    );
+
+    await expect(
+      service.resolveRuntimeReconciliation(adoptedRunInput),
+    ).rejects.toBe(persistenceFailure);
+    expect(eventPump.start).not.toHaveBeenCalled();
   });
 });
 

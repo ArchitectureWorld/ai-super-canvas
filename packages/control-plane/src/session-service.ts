@@ -10,6 +10,8 @@ import type {
   CreatedSession,
   OrchestrationPhase,
   PreparedRun,
+  ResolveRuntimeReconciliationInput,
+  RuntimeReconciliationResult,
   SessionRuntimeContext,
   StoredSessionSnapshot,
 } from '@ai-super-canvas/db';
@@ -387,6 +389,28 @@ export class SessionService {
       });
     this.activeRunDispatches.set(commandReceiptId, runner);
     return runner;
+  }
+
+  async resolveRuntimeReconciliation(
+    input: ResolveRuntimeReconciliationInput,
+  ): Promise<RuntimeReconciliationResult> {
+    const result = await this.repository.resolveRuntimeReconciliation(input);
+    if (
+      result.phase === 'attached'
+      && result.outcome === 'adopted'
+      && result.resource.kind === 'run'
+      && (
+        result.resource.status === 'queued'
+        || result.resource.status === 'running'
+        || result.resource.status === 'waiting_approval'
+      )
+    ) {
+      this.eventPump.start({
+        actor: input.actor,
+        runId: result.resource.runId,
+      });
+    }
+    return result;
   }
 
   async getRunEvents(
