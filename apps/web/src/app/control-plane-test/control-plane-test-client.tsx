@@ -1,8 +1,488 @@
 'use client';
 
+import { useCallback, useEffect, useRef, useState } from 'react';
+
 import styles from './control-plane-test.module.css';
 
+const bootstrapCommandKey =
+  'ai-super-canvas.control-plane-test.bootstrap-command';
+const lastSessionKey =
+  'ai-super-canvas.control-plane-test.last-session';
+const pendingSessionCommandKey =
+  'ai-super-canvas.control-plane-test.pending-session-command';
+const pendingRunCommandKey =
+  'ai-super-canvas.control-plane-test.pending-run-command';
+
+const uuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+interface BootstrapResult {
+  accountId: string;
+  agentId: string;
+  agentBindingId: string;
+  workspaceId: string;
+  workflowId: string;
+  trunkRevisionId: string;
+}
+
+interface SessionMessage {
+  messageId: string;
+  runId: string | null;
+  ordinal: number;
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  content: unknown;
+  status: string;
+}
+
+interface SessionTranscript {
+  sessionId: string;
+  status: string;
+  messages: SessionMessage[];
+  activeRun: null | { runId: string; status: string };
+  reconciliationState: null | {
+    kind: 'run-reconciling' | 'runtime-unavailable';
+    message: string;
+  };
+  runtimeAvailability: 'available' | 'unavailable';
+}
+
+interface RunEvent {
+  sequence: number;
+  eventType: string;
+  payload: unknown;
+  occurredAt: string;
+}
+
+interface RunEventsPage {
+  events: RunEvent[];
+  nextAfter: number;
+  terminal: null | { status: 'succeeded' | 'failed' | 'cancelled' };
+}
+
+interface ApiErrorPayload {
+  error: { code: string; message: string; retryable: boolean };
+  commandReceiptId?: string;
+}
+
+interface PendingRun {
+  commandId: string;
+  idempotencyKey: string;
+  sessionId: string;
+  content: string;
+}
+
+const recoveryByCode: Record<string, string> = {
+  command_requires_reconciliation:
+    '服务器正在确认上次操作。请稍后重试，页面会复用同一个命令编号。',
+  command_persistence_unconfirmed:
+    '服务器暂时无法确认是否已保存。请稍后重试，页面会复用同一个命令编号。',
+  runtime_session_unavailable:
+    '历史记录还在，但旧运行环境已断开。请新建测试 Session。',
+  active_run_conflict:
+    '这个 Session 仍有任务在处理中，请等待当前任务结束。',
+  command_payload_conflict:
+    '上次操作的内容与本次不同。请新建测试 Session 后再试。',
+  run_idempotency_conflict:
+    '检测到不一致的重复发送。请新建测试 Session 后再试。',
+  not_found:
+    '找不到这条历史记录，可能已被清理。请新建测试 Session。',
+  internal_error:
+    '后端暂时出错。请先点“重新连接”，如果仍失败再查看服务日志。',
+  invalid_response:
+    '后端返回了无法识别的数据。请重新连接后再试。',
+  http_503:
+    'PostgreSQL 暂时不可用。请确认数据库和迁移已就绪，再重新连接。',
+};
+
+class ClientRequestError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly retryable = false,
+    readonly status?: number,
+    readonly commandReceiptId?: string,
+  ) {
+    super(message);
+    this.name = 'ClientRequestError';
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isApiErrorPayload(value: unknown): value is ApiErrorPayload {
+  if (!isRecord(value) || !isRecord(value.error)) return false;
+  return (
+    typeof value.error.code === 'string'
+    && typeof value.error.message === 'string'
+    && typeof value.error.retryable === 'boolean'
+  );
+}
+
+function recoveryMessage(code: string): string {
+  return recoveryByCode[code]
+    ?? '操作没有完成。请重新连接后再试；页面不会自动重复写入。';
+}
+
+async function jsonRequest<T>(
+  url: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const headers = new Headers(init.headers);
+  if (init.body !== undefined) headers.set('Content-Type', 'application/json');
+
+  const response = await fetch(url, {
+    ...init,
+    headers,
+    cache: 'no-store',
+  });
+  const text = await response.text();
+  let payload: unknown;
+
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    throw new ClientRequestError(
+      'invalid_response',
+      recoveryMessage('invalid_response'),
+      false,
+      response.status,
+    );
+  }
+
+  if (isApiErrorPayload(payload)) {
+    throw new ClientRequestError(
+      payload.error.code,
+      recoveryMessage(payload.error.code),
+      payload.error.retryable,
+      response.status,
+      payload.commandReceiptId,
+    );
+  }
+
+  if (!response.ok) {
+    const code = `http_${response.status}`;
+    throw new ClientRequestError(
+      code,
+      recoveryMessage(code),
+      response.status >= 500,
+      response.status,
+    );
+  }
+
+  return payload as T;
+}
+
+function storedUuid(key: string): string | null {
+  const value = localStorage.getItem(key);
+  if (!value) return null;
+  if (uuidPattern.test(value)) return value;
+  localStorage.removeItem(key);
+  return null;
+}
+
+function commandId(key: string): string {
+  const stored = storedUuid(key);
+  if (stored) return stored;
+  const created = crypto.randomUUID();
+  localStorage.setItem(key, created);
+  return created;
+}
+
+function storedPendingRun(): PendingRun | null {
+  const raw = localStorage.getItem(pendingRunCommandKey);
+  if (!raw) return null;
+
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (
+      isRecord(value)
+      && typeof value.commandId === 'string'
+      && uuidPattern.test(value.commandId)
+      && typeof value.idempotencyKey === 'string'
+      && value.idempotencyKey.length > 0
+      && value.idempotencyKey.length <= 160
+      && typeof value.sessionId === 'string'
+      && uuidPattern.test(value.sessionId)
+      && typeof value.content === 'string'
+      && value.content.trim().length > 0
+      && value.content.length <= 20_000
+    ) {
+      return {
+        commandId: value.commandId,
+        idempotencyKey: value.idempotencyKey,
+        sessionId: value.sessionId,
+        content: value.content,
+      };
+    }
+  } catch {
+    // Invalid browser pointers are discarded below.
+  }
+
+  localStorage.removeItem(pendingRunCommandKey);
+  return null;
+}
+
+function displayContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (
+    isRecord(content)
+    && typeof content.text === 'string'
+  ) {
+    return content.text;
+  }
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return '[无法显示的结构化内容]';
+  }
+}
+
+function roleLabel(role: SessionMessage['role']): string {
+  if (role === 'user') return '你';
+  if (role === 'assistant') return 'Fake Runtime';
+  if (role === 'system') return '系统';
+  return '工具';
+}
+
+function displayError(reason: unknown): string {
+  return reason instanceof ClientRequestError
+    ? reason.message
+    : '页面操作失败。请重新连接后再试。';
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
 export function ControlPlaneTestClient() {
+  const [bootstrap, setBootstrap] = useState<BootstrapResult | null>(null);
+  const [transcript, setTranscript] = useState<SessionTranscript | null>(null);
+  const [content, setContent] = useState('请返回确定性测试回复');
+  const [events, setEvents] = useState<RunEvent[]>([]);
+  const [status, setStatus] = useState('正在连接真实后端');
+  const [error, setError] = useState('');
+  const [ready, setReady] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [hasPendingSession, setHasPendingSession] = useState(false);
+  const [pendingRun, setPendingRun] = useState<PendingRun | null>(null);
+  const initialized = useRef(false);
+
+  const loadTranscript = useCallback(async (sessionId: string) => {
+    const next = await jsonRequest<SessionTranscript>(
+      `/api/control-plane/sessions/${sessionId}/transcript`,
+    );
+    setTranscript(next);
+    return next;
+  }, []);
+
+  const initialize = useCallback(async () => {
+    setBusy(true);
+    setError('');
+    setReady(false);
+    setStatus('正在连接 PostgreSQL');
+
+    try {
+      await jsonRequest<{ status: 'ready'; database: 'ready' }>('/api/ready');
+      setStatus('正在初始化本地账号和工作区');
+      const result = await jsonRequest<BootstrapResult>(
+        '/api/control-plane/bootstrap',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            commandId: commandId(bootstrapCommandKey),
+            displayName: '本地测试用户',
+          }),
+        },
+      );
+      localStorage.removeItem(bootstrapCommandKey);
+      setBootstrap(result);
+      setReady(true);
+
+      const pendingSession = storedUuid(pendingSessionCommandKey);
+      setHasPendingSession(Boolean(pendingSession));
+      const restoredPendingRun = storedPendingRun();
+      setPendingRun(restoredPendingRun);
+      if (restoredPendingRun) setContent(restoredPendingRun.content);
+
+      const lastSessionId = storedUuid(lastSessionKey);
+      if (lastSessionId) {
+        try {
+          await loadTranscript(lastSessionId);
+          setStatus('历史已从 PostgreSQL 恢复');
+        } catch (reason) {
+          if (
+            reason instanceof ClientRequestError
+            && reason.code === 'not_found'
+          ) {
+            localStorage.removeItem(lastSessionKey);
+            setTranscript(null);
+            setStatus('后端已就绪');
+          } else {
+            throw reason;
+          }
+        }
+      } else {
+        setStatus('后端已就绪');
+      }
+    } catch (reason) {
+      setError(displayError(reason));
+      setStatus('连接失败');
+    } finally {
+      setBusy(false);
+    }
+  }, [loadTranscript]);
+
+  useEffect(() => {
+    if (initialized.current) return;
+    initialized.current = true;
+    void initialize();
+  }, [initialize]);
+
+  const createSession = useCallback(async () => {
+    if (!bootstrap || busy) return;
+    setBusy(true);
+    setError('');
+    setStatus('正在创建 Canvas Session 和 Runtime Session');
+    const pendingCommandId = commandId(pendingSessionCommandKey);
+    setHasPendingSession(true);
+
+    try {
+      const result = await jsonRequest<{
+        sessionId: string;
+        nodeId: string;
+        status: string;
+      }>('/api/control-plane/sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          commandId: pendingCommandId,
+          workflowId: bootstrap.workflowId,
+          agentBindingId: bootstrap.agentBindingId,
+          title: '真实后端测试 Session',
+        }),
+      });
+      localStorage.removeItem(pendingSessionCommandKey);
+      localStorage.setItem(lastSessionKey, result.sessionId);
+      localStorage.removeItem(pendingRunCommandKey);
+      setHasPendingSession(false);
+      setPendingRun(null);
+      setEvents([]);
+      await loadTranscript(result.sessionId);
+      setStatus('Session 已连接 Fake Runtime');
+    } catch (reason) {
+      setError(displayError(reason));
+      setStatus('新建 Session 未完成');
+    } finally {
+      setBusy(false);
+    }
+  }, [bootstrap, busy, loadTranscript]);
+
+  const pollRun = useCallback(async (sessionId: string, runId: string) => {
+    let after = 0;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const page = await jsonRequest<RunEventsPage>(
+        `/api/control-plane/runs/${runId}/events?after=${after}`,
+      );
+      setEvents((current) => {
+        const seen = new Set(current.map(({ sequence }) => sequence));
+        return [
+          ...current,
+          ...page.events.filter(({ sequence }) => !seen.has(sequence)),
+        ].sort((left, right) => left.sequence - right.sequence);
+      });
+      after = page.nextAfter;
+      await loadTranscript(sessionId);
+
+      if (page.terminal?.status === 'succeeded') return;
+      if (page.terminal?.status === 'failed') {
+        throw new ClientRequestError(
+          'run_failed',
+          'Run 已结束但没有成功。已保存的消息仍可查看，请新建 Session 后再试。',
+        );
+      }
+      if (page.terminal?.status === 'cancelled') {
+        throw new ClientRequestError(
+          'run_cancelled',
+          'Run 已取消。已保存的消息仍可查看，可以重新发送。',
+        );
+      }
+      await sleep(150);
+    }
+
+    throw new ClientRequestError(
+      'run_poll_timeout',
+      '等待回复超时。请重新连接查看 PostgreSQL 中的最新记录。',
+      true,
+    );
+  }, [loadTranscript]);
+
+  const sendMessage = useCallback(async () => {
+    if (
+      !transcript
+      || transcript.runtimeAvailability !== 'available'
+      || busy
+    ) {
+      return;
+    }
+
+    const restored = storedPendingRun();
+    if (restored && restored.sessionId !== transcript.sessionId) {
+      localStorage.removeItem(pendingRunCommandKey);
+    }
+    const trimmedContent = content.trim();
+    const nextPending = restored?.sessionId === transcript.sessionId
+      ? restored
+      : {
+          commandId: crypto.randomUUID(),
+          idempotencyKey: crypto.randomUUID(),
+          sessionId: transcript.sessionId,
+          content: trimmedContent,
+        };
+    if (!nextPending.content || nextPending.content.length > 20_000) return;
+
+    localStorage.setItem(
+      pendingRunCommandKey,
+      JSON.stringify(nextPending),
+    );
+    setPendingRun(nextPending);
+    setBusy(true);
+    setError('');
+    setStatus('Runtime 正在生成回复');
+
+    try {
+      const result = await jsonRequest<{ runId: string; status: string }>(
+        `/api/control-plane/sessions/${transcript.sessionId}/runs`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            commandId: nextPending.commandId,
+            idempotencyKey: nextPending.idempotencyKey,
+            content: nextPending.content,
+          }),
+        },
+      );
+      localStorage.removeItem(pendingRunCommandKey);
+      setPendingRun(null);
+      await pollRun(transcript.sessionId, result.runId);
+      setContent('');
+      setStatus('回复已写入 PostgreSQL');
+    } catch (reason) {
+      setError(displayError(reason));
+      setStatus('发送未完成');
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, content, pollRun, transcript]);
+
+  const canSend = Boolean(
+    transcript
+    && transcript.runtimeAvailability === 'available'
+    && content.trim()
+    && content.trim().length <= 20_000
+    && !busy,
+  );
+
   return (
     <main className={styles.page}>
       <div className={styles.shell}>
@@ -15,14 +495,62 @@ export function ControlPlaneTestClient() {
                 这里的测试 Session、消息和运行记录都会写入 PostgreSQL，不会沿用旧画布的浏览器演示数据。
               </p>
             </div>
-            <button className={styles.primaryButton} type="button" disabled>
-              新建测试 Session
+            <button
+              className={styles.primaryButton}
+              type="button"
+              disabled={!bootstrap || busy}
+              onClick={() => void createSession()}
+            >
+              {hasPendingSession ? '重试新建 Session' : '新建测试 Session'}
             </button>
           </div>
         </header>
 
+        {error ? (
+          <section className={`${styles.notice} ${styles.error}`} role="alert">
+            <p className={styles.noticeTitle}>{error}</p>
+            <div className={styles.actionRow}>
+              <button
+                className={styles.secondaryButton}
+                type="button"
+                disabled={busy}
+                onClick={() => void initialize()}
+              >
+                重新连接
+              </button>
+            </div>
+          </section>
+        ) : null}
+
+        {transcript?.runtimeAvailability === 'unavailable' ? (
+          <section className={`${styles.notice} ${styles.warning}`} role="status">
+            <p className={styles.noticeTitle}>
+              历史已恢复，但旧 Fake Runtime 已不可用。请新建测试 Session。
+            </p>
+          </section>
+        ) : null}
+
+        {transcript?.reconciliationState ? (
+          <section className={`${styles.notice} ${styles.warning}`} role="status">
+            <p className={styles.noticeTitle}>服务器正在核对运行状态</p>
+            <p className={styles.noticeCopy}>
+              {transcript.reconciliationState.message}
+            </p>
+          </section>
+        ) : null}
+
+        {pendingRun ? (
+          <section className={`${styles.notice} ${styles.warning}`} role="status">
+            <p className={styles.noticeTitle}>有一条未确认的发送，可安全重试</p>
+            <p className={styles.pendingContent}>{pendingRun.content}</p>
+          </section>
+        ) : null}
+
         <div className={styles.bodyGrid}>
-          <section className={styles.conversationColumn} aria-labelledby="transcript-title">
+          <section
+            className={styles.conversationColumn}
+            aria-labelledby="transcript-title"
+          >
             <div className={styles.panel}>
               <div className={styles.panelHeading}>
                 <div>
@@ -31,23 +559,57 @@ export function ControlPlaneTestClient() {
                     PostgreSQL 会话记录
                   </h2>
                 </div>
-                <span className={`${styles.stateBadge} ${styles.warning}`}>等待 Session</span>
+                <span
+                  className={`${styles.stateBadge} ${
+                    transcript ? styles.success : styles.warning
+                  }`}
+                >
+                  {transcript ? transcript.status : '等待 Session'}
+                </span>
               </div>
-              <div className={styles.emptyState}>
-                <p className={styles.emptyTitle}>还没有持久化消息</p>
-                <p className={styles.emptyCopy}>
-                  后端连接完成后，新建一个测试 Session，再发送第一条消息。
-                </p>
-              </div>
+              {transcript?.messages.length ? (
+                <div className={styles.transcriptList}>
+                  {transcript.messages.map((message) => (
+                    <article
+                      className={`${styles.message} ${
+                        message.role === 'assistant'
+                          ? styles.assistantMessage
+                          : ''
+                      }`}
+                      key={message.messageId}
+                      data-role={message.role}
+                    >
+                      <div className={styles.messageHeader}>
+                        <strong>{roleLabel(message.role)}</strong>
+                        <span>#{message.ordinal}</span>
+                      </div>
+                      <p className={styles.messageBody}>
+                        {displayContent(message.content)}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <div className={styles.emptyState}>
+                  <p className={styles.emptyTitle}>还没有持久化消息</p>
+                  <p className={styles.emptyCopy}>
+                    后端连接完成后，新建一个测试 Session，再发送第一条消息。
+                  </p>
+                </div>
+              )}
             </div>
 
             <form
               className={styles.composer}
               onSubmit={(event) => {
                 event.preventDefault();
+                void sendMessage();
               }}
             >
-              <label className={styles.label} htmlFor="control-plane-test-message">
+              <label
+                className={styles.label}
+                htmlFor="control-plane-test-message"
+              >
                 测试消息
               </label>
               <textarea
@@ -56,56 +618,105 @@ export function ControlPlaneTestClient() {
                 name="message"
                 placeholder="先新建测试 Session，再输入要交给真实后端的内容"
                 rows={4}
-                disabled
+                maxLength={20_000}
+                value={content}
+                onChange={(event) => setContent(event.target.value)}
+                disabled={
+                  !transcript
+                  || transcript.runtimeAvailability !== 'available'
+                  || busy
+                }
               />
               <div className={styles.composerFooter}>
-                <p className={styles.composerHint}>消息内容不会写入 localStorage。</p>
-                <button className={styles.primaryButton} type="submit" disabled>
-                  发送到真实后端
+                <p className={styles.composerHint}>
+                  消息正文只在待确认重试期间临时保存，成功后立即清除。
+                </p>
+                <button
+                  className={styles.primaryButton}
+                  type="submit"
+                  disabled={!canSend}
+                >
+                  {pendingRun ? '重试上次发送' : '发送到真实后端'}
                 </button>
               </div>
             </form>
           </section>
 
           <aside className={styles.sideColumn}>
-            <section className={styles.panel} aria-labelledby="backend-status-title">
+            <section
+              className={styles.panel}
+              aria-labelledby="backend-status-title"
+            >
               <div className={styles.panelHeading}>
                 <div>
                   <p className={styles.eyebrow}>BACKEND STATUS</p>
                   <h2 className={styles.sectionTitle} id="backend-status-title">
-                    正在连接真实后端
+                    {status}
                   </h2>
                 </div>
-                <span className={styles.pulse} aria-hidden="true" />
+                <span
+                  className={ready ? styles.readyDot : styles.pulse}
+                  aria-hidden="true"
+                />
               </div>
               <dl className={styles.statusList}>
                 <div className={styles.statusRow}>
                   <dt className={styles.statusName}>PostgreSQL</dt>
-                  <dd className={styles.statusValue}>等待握手</dd>
+                  <dd className={styles.statusValue}>
+                    {ready ? '已连接' : '等待握手'}
+                  </dd>
                 </div>
                 <div className={styles.statusRow}>
-                  <dt className={styles.statusName}>DeterministicFakeRuntime</dt>
-                  <dd className={styles.statusValue}>等待握手</dd>
+                  <dt className={styles.statusName}>
+                    DeterministicFakeRuntime
+                  </dt>
+                  <dd className={styles.statusValue}>
+                    {transcript?.runtimeAvailability === 'available'
+                      ? 'Session 可用'
+                      : transcript?.runtimeAvailability === 'unavailable'
+                        ? '旧 Session 已断开'
+                        : bootstrap
+                          ? '等待 Session'
+                          : '等待握手'}
+                  </dd>
                 </div>
               </dl>
             </section>
 
-            <section className={styles.panel} aria-labelledby="run-events-title">
+            <section
+              className={styles.panel}
+              aria-label="已持久化 Run 事件"
+            >
               <div className={styles.panelHeading}>
                 <div>
                   <p className={styles.eyebrow}>RUN EVENT LOG</p>
-                  <h2 className={styles.sectionTitle} id="run-events-title">
+                  <h2 className={styles.sectionTitle}>
                     已持久化 Run 事件
                   </h2>
                 </div>
               </div>
-              <p className={styles.eventPlaceholder}>启动 Run 后，这里会显示从数据库读取的事件。</p>
+              {events.length ? (
+                <div className={styles.eventList}>
+                  {events.map((event) => (
+                    <span className={styles.eventBadge} key={event.sequence}>
+                      {event.sequence} · {event.eventType}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <p className={styles.eventPlaceholder}>
+                  启动 Run 后，这里会显示从数据库读取的事件。
+                </p>
+              )}
             </section>
 
-            <section className={`${styles.notice} ${styles.success}`} aria-label="数据边界">
+            <section
+              className={`${styles.notice} ${styles.success}`}
+              aria-label="数据边界"
+            >
               <p className={styles.noticeTitle}>页面与旧画布完全隔离</p>
               <p className={styles.noticeCopy}>
-                浏览器只保留恢复操作需要的标识，不缓存对话正文或运行输出。
+                浏览器只保留恢复操作需要的标识，不缓存已完成的对话正文或运行输出。
               </p>
             </section>
           </aside>

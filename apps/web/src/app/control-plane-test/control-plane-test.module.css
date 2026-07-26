@@ -142,6 +142,46 @@
   line-height: 1.65;
 }
 
+.transcriptList {
+  display: grid;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.message {
+  padding: 15px 16px;
+  border: 1px solid #294337;
+  border-radius: 13px;
+  background: #08130e;
+}
+
+.assistantMessage {
+  border-left: 3px solid #8ce7b2;
+  background: #0c1d15;
+}
+
+.messageHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #7f988b;
+  font-size: 0.75rem;
+}
+
+.messageHeader strong {
+  color: #dcebe3;
+}
+
+.messageBody {
+  margin: 9px 0 0;
+  overflow-wrap: anywhere;
+  color: #d5e3dc;
+  font-size: 0.92rem;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
 .composer {
   padding: 22px;
 }
@@ -219,6 +259,26 @@
   opacity: 1;
 }
 
+.secondaryButton {
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid currentColor;
+  border-radius: 9px;
+  color: inherit;
+  background: transparent;
+  font-weight: 750;
+}
+
+.secondaryButton:focus-visible {
+  outline: 3px solid #d4f9e3;
+  outline-offset: 3px;
+}
+
+.secondaryButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .statusList {
   display: grid;
   gap: 11px;
@@ -261,6 +321,15 @@
   animation: pulse 1.8s ease-in-out infinite;
 }
 
+.readyDot {
+  width: 10px;
+  height: 10px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: #8ce7b2;
+  box-shadow: 0 0 0 6px rgba(140, 231, 178, 0.12);
+}
+
 .eventPlaceholder {
   margin-top: 20px;
   color: #789084;
@@ -268,8 +337,32 @@
   line-height: 1.65;
 }
 
+.eventList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.eventBadge {
+  max-width: 100%;
+  padding: 7px 9px;
+  overflow-wrap: anywhere;
+  border: 1px solid #315843;
+  border-radius: 999px;
+  color: #b7ebca;
+  background: #0d2819;
+  font-size: 0.72rem;
+}
+
 .notice {
   padding: 17px 18px;
+}
+
+.hero + .notice,
+.notice + .notice,
+.notice + .bodyGrid {
+  margin-top: 20px;
 }
 
 .noticeTitle {
@@ -282,6 +375,22 @@
   color: #8da398;
   font-size: 0.76rem;
   line-height: 1.6;
+}
+
+.pendingContent {
+  margin: 10px 0 0;
+  overflow-wrap: anywhere;
+  color: #f4d99f;
+  font-size: 0.82rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.actionRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
 }
 
 .error {
@@ -335,11 +444,13 @@
   }
 
   .primaryButton,
+  .secondaryButton,
   .textarea {
     min-height: 44px;
   }
 
-  .primaryButton {
+  .primaryButton,
+  .secondaryButton {
     width: 100%;
   }
 
