@@ -29,6 +29,10 @@ async function responseBody(response: Response) {
   }>;
 }
 
+function expectNoStore(response: Response) {
+  expect(response.headers.get('cache-control')).toBe('no-store');
+}
+
 describe('control-plane HTTP boundary', () => {
   it('maps malformed JSON to a sanitized no-store 400 response', async () => {
     const reason = await parseJson(request('{'), z.object({ name: z.string() })).catch(
@@ -40,6 +44,7 @@ describe('control-plane HTTP boundary', () => {
     expect(await responseBody(response)).toEqual({
       error: { code: 'malformed_json', message: 'Request body must be valid JSON', retryable: false },
     });
+    expectNoStore(response);
   });
 
   it('rejects server-owned fields with a strict request schema', async () => {
@@ -53,6 +58,7 @@ describe('control-plane HTTP boundary', () => {
     expect(await responseBody(response)).toEqual({
       error: { code: 'invalid_request', message: 'Request validation failed', retryable: false },
     });
+    expectNoStore(response);
   });
 
   it.each([
@@ -67,7 +73,7 @@ describe('control-plane HTTP boundary', () => {
     expect(await responseBody(response)).toEqual({
       error: { code, message: 'Request conflicts with the current server state', retryable: false },
     });
-    expect(response.headers.get('cache-control')).toBe('no-store');
+    expectNoStore(response);
   });
 
   it('sanitizes authorization errors as not found', async () => {
@@ -77,13 +83,14 @@ describe('control-plane HTTP boundary', () => {
     expect(await responseBody(response)).toEqual({
       error: { code: 'not_found', message: 'Resource not found', retryable: false },
     });
+    expectNoStore(response);
   });
 
   it.each([
     ['command_requires_reconciliation', true, 202, 'receipt-1'],
     ['command_persistence_unconfirmed', true, 202, 'receipt-1'],
-    ['runtime_session_unavailable', false, 409, undefined],
-    ['runtime_operation_failed', true, 500, undefined],
+    ['runtime_session_unavailable', false, 409, 'receipt-2'],
+    ['runtime_operation_failed', true, 500, 'receipt-2'],
   ] as const)('maps application error %s with its stable retryability', async (code, retryable, status, receiptId) => {
     const response = errorResponse(new ControlPlaneApplicationError(code, 'safe application message', retryable, receiptId));
     const body = await responseBody(response);
@@ -96,8 +103,9 @@ describe('control-plane HTTP boundary', () => {
     });
     if (status === 202) {
       expect(response.headers.get('retry-after')).toBe('2');
-      expect(body.commandReceiptId).toBe('receipt-1');
     }
+    expect(body.commandReceiptId).toBe(receiptId);
+    expectNoStore(response);
   });
 
   it('omits commandReceiptId from an accepted response when none is available', async () => {
@@ -112,6 +120,7 @@ describe('control-plane HTTP boundary', () => {
 
     expect(response.status).toBe(202);
     expect(body).not.toHaveProperty('commandReceiptId');
+    expectNoStore(response);
   });
 
   it('does not leak unexpected errors and logs only their name', async () => {
@@ -122,6 +131,7 @@ describe('control-plane HTTP boundary', () => {
     expect(await responseBody(response)).toEqual({
       error: { code: 'internal_error', message: 'An unexpected error occurred', retryable: false },
     });
+    expectNoStore(response);
     expect(logger.error).toHaveBeenCalledExactlyOnceWith('control_plane_request_failed', { errorName: 'Error' });
   });
 
@@ -129,12 +139,13 @@ describe('control-plane HTTP boundary', () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
     try {
-      errorResponse(new Error('database password is secret'));
+      const response = errorResponse(new Error('database password is secret'));
 
       expect(consoleError).toHaveBeenCalledExactlyOnceWith(
         'control_plane_request_failed',
         { errorName: 'Error' },
       );
+      expectNoStore(response);
     } finally {
       consoleError.mockRestore();
     }

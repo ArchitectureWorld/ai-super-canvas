@@ -94,6 +94,15 @@ function conflictResponse(code: string): Response {
   );
 }
 
+function applicationErrorBody(reason: ControlPlaneApplicationError) {
+  return {
+    ...errorBody(reason.code, reason.message, reason.retryable),
+    ...(reason.commandReceiptId
+      ? { commandReceiptId: reason.commandReceiptId }
+      : {}),
+  };
+}
+
 export function errorResponse(
   reason: unknown,
   logger: SafeErrorLogger = defaultLogger,
@@ -126,29 +135,20 @@ export function errorResponse(
       reason.code === 'command_persistence_unconfirmed'
     ) {
       return noStoreJson(
-        {
-          ...errorBody(
-            reason.code,
-            reason.message,
-            reason.retryable,
-          ),
-          ...(reason.commandReceiptId === undefined
-            ? {}
-            : { commandReceiptId: reason.commandReceiptId }),
-        },
+        applicationErrorBody(reason),
         { status: 202, headers: { 'Retry-After': '2' } },
       );
     }
 
     if (reason.code === 'runtime_session_unavailable') {
       return noStoreJson(
-        errorBody(reason.code, reason.message, reason.retryable),
+        applicationErrorBody(reason),
         { status: 409 },
       );
     }
 
     return noStoreJson(
-      errorBody(reason.code, reason.message, reason.retryable),
+      applicationErrorBody(reason),
       { status: 500 },
     );
   }
