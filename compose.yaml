@@ -15,7 +15,8 @@ services:
       NODE_ENV: production
       NEXT_TELEMETRY_DISABLED: ${NEXT_TELEMETRY_DISABLED:-1}
       DATABASE_URL: postgres://${POSTGRES_USER:-canvas}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-canvas}
-      APP_OWNER_ID: ${APP_OWNER_ID:-local-owner}
+      AUTH_MODE: ${AUTH_MODE:-local}
+      APP_OWNER_SUBJECT: ${APP_OWNER_SUBJECT:-local:owner}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
       AI_AVAILABLE_MODELS: ${AI_AVAILABLE_MODELS:-}
