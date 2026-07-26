@@ -57,6 +57,13 @@
       "when": 1784874756637,
       "tag": "0007_motionless_black_queen",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1785050310077,
+      "tag": "0008_transcript_version_backfill",
+      "breakpoints": true
     }
   ]
 }
