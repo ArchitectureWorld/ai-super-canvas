@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import type { ActorContext } from '@ai-super-canvas/core';
 import postgres from 'postgres';
+import { z } from 'zod';
 
 import {
   AuthorizationError,
@@ -59,6 +60,8 @@ interface CanonicalPayload {
   hash: string;
   text: string;
 }
+
+const runtimeRunAcceptedAtSchema = z.iso.datetime({ offset: true });
 
 interface BootstrapReceiptRow {
   auth_subject: string;
@@ -1673,10 +1676,13 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     if (!runtimeRun.externalRunRef.trim()) {
       throw new Error('Runtime Run reference must not be empty');
     }
-    const acceptedAt = new Date(runtimeRun.acceptedAt);
-    if (Number.isNaN(acceptedAt.getTime())) {
+    const acceptedAtResult = runtimeRunAcceptedAtSchema.safeParse(
+      runtimeRun.acceptedAt,
+    );
+    if (!acceptedAtResult.success) {
       throw new Error('Runtime Run acceptedAt must be an ISO timestamp');
     }
+    const acceptedAt = new Date(acceptedAtResult.data);
 
     const [run] = await tx<{
       runtime_run_ref: string | null;

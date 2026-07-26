@@ -2620,7 +2620,7 @@ describe('PostgresControlPlaneRepository', () => {
       suffix: 'run-adopt',
       attachRun: false,
     });
-    const acceptedAt = '2026-07-18T04:40:00.000Z';
+    const acceptedAt = '2026-07-18T12:40:00+08:00';
     const evidence = { listRuns: 'single-match' };
     await repository.markRuntimeCommandReconciling({
       actor: fixture.actor,
@@ -2675,8 +2675,60 @@ describe('PostgresControlPlaneRepository', () => {
       compensation_evidence: evidence,
       compensation_error: null,
     });
-    expect(state?.run_started_at?.toISOString()).toBe(acceptedAt);
+    expect(state?.run_started_at?.toISOString()).toBe(
+      '2026-07-18T04:40:00.000Z',
+    );
   });
+
+  it.each([
+    ['numeric string', '0', 'run-adopt-invalid-numeric'],
+    [
+      'nonexistent calendar date',
+      '2026-02-30T04:39:00.000Z',
+      'run-adopt-invalid-calendar-date',
+    ],
+  ])(
+    'rejects %s acceptedAt without mutating reconciliation state',
+    async (_caseName, acceptedAt, suffix) => {
+      const { fixture, prepared, externalRunRef } = await prepareRuntimeRun({
+        suffix,
+        attachRun: false,
+      });
+      await repository.markRuntimeCommandReconciling({
+        actor: fixture.actor,
+        commandReceiptId: prepared.commandReceiptId,
+        externalResourceKind: 'run',
+        externalResourceRef: externalRunRef,
+        error: 'Run attach outcome unknown',
+      });
+      const before = await loadRunReconciliationState(
+        prepared.commandReceiptId,
+      );
+
+      let resolutionError: string | null = null;
+      try {
+        await repository.resolveRuntimeReconciliation({
+          actor: fixture.actor,
+          commandReceiptId: prepared.commandReceiptId,
+          resolution: {
+            kind: 'adopt-run',
+            runtimeRun: { externalRunRef, acceptedAt },
+            evidence: { listRuns: `invalid-accepted-at:${suffix}` },
+          },
+        });
+      } catch (error) {
+        resolutionError = error instanceof Error ? error.message : String(error);
+      }
+
+      expect({
+        error: resolutionError,
+        state: await loadRunReconciliationState(prepared.commandReceiptId),
+      }).toEqual({
+        error: 'Runtime Run acceptedAt must be an ISO timestamp',
+        state: before,
+      });
+    },
+  );
 
   it('rejects a conflicting attached Runtime Run replay without mutating state', async () => {
     const { fixture, prepared, externalRunRef } = await prepareRuntimeRun({
