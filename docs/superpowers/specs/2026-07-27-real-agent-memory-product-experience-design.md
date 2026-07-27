@@ -3,7 +3,7 @@
 ## 状态
 
 - 日期：2026-07-27
-- 状态：设计已在对话中逐节确认，等待书面规格审阅
+- 状态：已确认，进入实施计划
 - 基线：`main@48ac3071a5514af08e5f806792020c66aaa2b6a6`
 - 产品入口：真实 AI Super Canvas 画板 `/`
 - 非产品入口：`/control-plane-test`
@@ -47,6 +47,9 @@
 - NSY 账号可选择 Jarvis、乔晶晶。
 - 管理员可查看和选择全部三个 Agent。
 - 普通账号不能通过隐藏参数或直接调用 API 越权使用另一个账号的个人助理。
+- Agent grant 只授权账号创建和使用自己的 Session，不授权读取其他账号
+  使用同一 Jarvis/Workspace 创建的 Session。首版没有 Session 分享模型；
+  Session 历史只对创建账号可见，管理员角色也不自动绕过。
 - 后续管理后台统一维护 Agent、Binding、账号授权、默认 Agent、启停状态和默认记忆策略；本次不实现管理后台。
 
 ### 2.3 Agent 切换
@@ -140,7 +143,7 @@ Agent 和记忆配置位于真实画板的节点控制面板中。现有节点�
 
 ### 4.3 高级 Session 选择
 
-- Session 列表只包含当前账号有权使用、且绑定到当前 Agent 的 Session。
+- Session 列表只包含当前账号自己创建、且绑定到当前 Agent 的 Session。
 - 选择项显示用户可理解的标题、项目和更新时间，不显示 Runtime ref。
 - 取消某个 Session 后，下一个 Run 不再包含它。
 - 切换 Agent 后，已选 Session 全部清空。
@@ -169,6 +172,12 @@ Agent 和记忆配置位于真实画板的节点控制面板中。现有节点�
 - 模型、工具和审批策略。
 
 后续调整设置只产生新的 SessionConfigRevision，不修改旧 Run 的输入快照。
+如果策略或解析后的上下文 digest 发生变化，下一个 Run 必须使用新的
+`canvas:` Runtime Session，只重放 Canvas 已持久化的安全 transcript；旧
+Runtime Session ref 转为历史，不能在原 Session 中就地缩窄策略，以免继续
+携带旧长期记忆或缓存 prompt。
+策略收窄不删除当前 Canvas Session 已可见的消息；已经出现在旧回复里的内容
+仍属于“当前对话”。隔离负向测试必须使用从未回显进当前 transcript 的标记。
 
 ### 4.6 数据模型补强
 
@@ -198,6 +207,13 @@ Agent 和记忆配置位于真实画板的节点控制面板中。现有节点�
 ```
 
 浏览器永远不直接连接 Jarvis 或 Hermes，不获得 API key，也不决定 Runtime endpoint。
+
+由于当前 Web 运行在 Docker 容器内，而 Jarvis 只监听宿主 loopback，
+落地时在 Registry 与真实 Runtime 之间增加受权限保护的宿主 Unix Socket
+Worker。Worker 只是 Canvas 的本机 transport adapter：它直接连接 Jarvis
+Gateway 或 profile-scoped ACP，不经过旧 Control Center 或 Family Gateway；
+它不新增 TCP 端口，也不把 Hermes home、profile 密钥或原始记忆挂进 Web
+容器。
 
 ### 5.1 Canvas 事实源
 
@@ -242,7 +258,10 @@ Fake Runtime 只用于自动测试和显式开发模式，不能成为生产失�
 
 Jarvis 直接连接当前正在运行的家庭 Jarvis Gateway，使用其现有身份、人格、记忆、技能和工具。
 
-Canvas 使用服务端 secretRef 解析认证信息，并通过 Hermes 的结构化 Run、事件、审批、停止和 Session 接口完成映射。浏览器不直接访问 Jarvis 本机接口。
+Canvas 使用服务端 secretRef 解析认证信息，并通过 Hermes 的结构化 Run、
+事件和 Session 接口完成映射。浏览器不直接访问 Jarvis 本机接口。首版的
+审批与停止能力在具备 durable receipt 和 outcome lookup 前明确为
+unsupported，产品不显示相关入口，也不启用需要交互审批的工具。
 
 Canvas 为 Jarvis 使用独立的 `canvas:` Session key，不能复用 Discord、cron、DinnerPlanner 或其他家庭入口的会话标识。Agent 全部记忆模式可以读取获准的 Jarvis 长期记忆，但短期对话历史仍按 Canvas Session 隔离。
 
@@ -283,7 +302,9 @@ Runtime 不支持某模式时，Adapter 必须诚实声明 unsupported，前端�
 
 - Account 身份来自服务端验证过的会话；
 - 首版本机身份采用 Canvas 自己的设备配对会话；
-- 管理员通过服务器命令为指定 Account 生成十分钟有效、只能使用一次的配对码；
+- 受本机 OS/数据库权限保护的 `local_operator` 命令为指定 Account 生成
+  十分钟有效、只能使用一次的配对码，并如实记录 operator issuer，不伪装成
+  某个管理员 Account；
 - `/pair` 用配对码换取高熵随机 Session token；
 - 浏览器只保存 Host-only、HttpOnly、SameSite=Strict Cookie；
 - 数据库只保存 token hash、Account、到期时间、创建时间和撤销时间；
@@ -299,9 +320,11 @@ Runtime 不支持某模式时，Adapter 必须诚实声明 unsupported，前端�
 ### 6.1 进入画板
 
 1. 服务端解析当前 Account。
-2. 查询有效 Agent grants 和 Account.defaultAgentId。
-3. 返回可用 Agent 的安全摘要。
-4. 画板默认选择 Jarvis。
+2. 查询有效 Agent grants 和存储的 Account default Agent。
+3. 返回可用 Agent 的安全摘要，以及只可能指向该过滤列表成员的
+   `effectiveDefaultAgentId: string | null`。
+4. 正常种子账号的有效默认值是 Jarvis；若默认 grant 被撤销则返回 `null`，
+   有其他授权时要求用户显式选择，零授权时显示安全空状态而不创建 draft。
 5. 节点已有 Session 时，从服务端恢复 AgentBinding 和 SessionConfigRevision。
 
 ### 6.2 创建 Session
@@ -389,6 +412,9 @@ Runtime 不支持某模式时，Adapter 必须诚实声明 unsupported，前端�
 - Canvas 与现有 multiplex gateway 并发访问同一 profile 时不串 Session、不丢记忆更新；
 - Agent grant 和 default Agent；
 - ZZH/NSY/API 越权；
+- ZZH、NSY 和管理员共享 Jarvis/Workspace 时仍看不到彼此 Session、边和
+  画板位置；
+- 空账号从“新建对话”草稿创建并 attach 第一条真实 Session；
 - Agent 切换后的新 Session；
 - 未知 Runtime 结果、幂等、reconciliation 和手动重试；
 - Fake Runtime 禁止生产回退；
@@ -400,6 +426,9 @@ Runtime 不支持某模式时，Adapter 必须诚实声明 unsupported，前端�
 - Run 上下文快照不可变；
 - secret 日志和数据库扫描；
 - 刷新、应用重启和 Runtime 重启恢复。
+- 真实 Run 闸门关闭时所有 Runtime 写入在 Message/Run 落库前 fail closed，
+  但 `/` 和历史仍可读；
+- 停止 Runtime Worker 不连带停止 Canvas，恢复 Worker 后无需重启 Web。
 
 ### 9.2 真实 Runtime 证明
 
