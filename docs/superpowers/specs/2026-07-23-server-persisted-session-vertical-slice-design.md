@@ -117,6 +117,11 @@
 
 V0.1 部署约束为单 web 进程。composition root 在开发热重载中通过 `globalThis` 保持进程内单例，`RunEventPump` 用进程内 active-Run 注册表拒绝第二个消费者。多副本部署需要数据库租约或专用 worker，在另一个规格中设计；本纵切不得把进程内互斥宣称为多副本安全。
 
+readiness 复用同一个 `PostgresControlPlaneRepository` 连接池，但通过独立
+Repository loader 探测，不创建或调用 Runtime、RunEventPump 或 SessionService。
+探测使用有限 `connect_timeout`、事务级 PostgreSQL `statement_timeout` 和
+`SELECT 1`；超时由数据库取消，不创建第二个连接池。
+
 服务继续使用当前默认的 loopback 绑定；本地 Alpha Route 不应在未加入正式认证前暴露到公网或不受信任 LAN。
 
 ### 5.3 Route Handlers
@@ -152,14 +157,18 @@ GET /api/control-plane/runs/:runId/events?after=0
   200: { events, nextAfter, terminal: null | { status: "succeeded" | "failed" | "cancelled" } }
 
 GET /api/control-plane/sessions/:sessionId/transcript
-  200: { sessionId, messages, activeRun, reconciliationState, runtimeAvailability: "available" | "unavailable" }
+  200: { sessionId, status, messages, activeRun, reconciliationState, runtimeAvailability: "available" | "unavailable" }
 
 GET /api/ready
   200: { status: "ready", database: "ready" }
   503: { status: "not-ready", database: "unavailable" }
 ```
 
-V0.1 事件接口读取 PostgreSQL 中已经持久化的事件，不直接消费 Runtime stream。客户端重复请求 `after=lastSequence`，直到收到终态。这里采用短轮询 JSON，不在第一版引入长期 SSE 连接；以后可以在不改变 application service 的前提下替换传输层。`reconciliationState` 为 `null`，或 `{ kind: "run-reconciling" | "runtime-unavailable", message: string }`。readiness 使用受限应用账号执行带短超时的 `SELECT 1`，不调用 Runtime，也不把 liveness 和 readiness 混成同一接口。
+V0.1 事件接口读取 PostgreSQL 中已经持久化的事件，不直接消费 Runtime stream。客户端重复请求 `after=lastSequence`，直到收到终态。这里采用短轮询 JSON，不在第一版引入长期 SSE 连接；以后可以在不改变 application service 的前提下替换传输层。`reconciliationState` 为 `null`，或 `{ kind: "run-reconciling" | "runtime-unavailable", message: string }`。readiness 执行带短超时的 `SELECT 1`，不调用 Runtime，也不把 liveness 和 readiness 混成同一接口。
+
+API PR 的隔离集成测试用 `APP_DATABASE_URL` 验证非 owner 身份的 readiness。
+当前 production Compose 仍复用既有数据库 owner 连接，因此本 PR 不宣称生产
+账号已经受限；受限应用角色、最小 grants 和部署接线是 LAN 暴露前的硬门槛。
 
 ## 7. 一次完整操作的数据流
 
@@ -194,12 +203,17 @@ V0.1 事件接口读取 PostgreSQL 中已经持久化的事件，不直接消费
 | 场景 | HTTP | 用户表面状态 |
 | --- | --- | --- |
 | 非法 JSON、UUID 或 schema | 400 | 校验失败 |
-| command/payload 或 active Run 冲突 | 409 | 冲突，可刷新当前状态 |
+| command/payload、active Run、Run 状态或 Runtime Session 不可用 | 409 | 冲突，可刷新当前状态或新建 Session |
 | 未授权或资源不可见 | 404 | 不泄露资源是否存在 |
 | dispatch 结果未知 | 202 | 需要对账，保留 commandId |
 | 数据库未就绪 | 503 | 服务暂不可用，可重试 |
 | 内部错误 | 500 | 稳定错误码，不返回堆栈、SQL 或 Runtime ref |
 
+
+`command_requires_reconciliation` 和 `command_persistence_unconfirmed`
+按未知 dispatch 返回 `202` 和 `Retry-After: 2`；
+`runtime_session_unavailable` 返回 `409`；`runtime_operation_failed`
+按内部错误返回 `500`，同时保留稳定的 `retryable` 字段。
 日志可以记录关联 ID 和内部诊断，但不得记录 secret、完整工具输入或未脱敏的私有上下文。
 
 所有错误响应使用稳定结构：
@@ -232,7 +246,7 @@ V0.1 事件接口读取 PostgreSQL 中已经持久化的事件，不直接消费
 ### 11.2 Route 合约测试
 
 - server-owned ActorContext；
-- 非法 JSON、UUID 和 path/body mismatch；
+- 非法 JSON、UUID、分页 cursor 和伪造的 server-owned 字段；
 - idempotency conflict、active Run conflict 和 404 隐藏；
 - 事件分页边界；
 - readiness 的 200/503；

@@ -5,9 +5,14 @@ import type { PersistableRunEvent } from './control-plane-run-types';
 import { createPostgresControlPlaneRepository } from './postgres-control-plane-repository';
 
 const databaseUrl = process.env.DATABASE_URL;
+const appDatabaseUrl = process.env.APP_DATABASE_URL;
 
 if (!databaseUrl) {
   throw new Error('DATABASE_URL is required for repository integration tests');
+}
+
+if (!appDatabaseUrl) {
+  throw new Error('APP_DATABASE_URL is required for readiness integration tests');
 }
 
 describe('PostgresControlPlaneRepository', () => {
@@ -209,6 +214,54 @@ describe('PostgresControlPlaneRepository', () => {
       ORDER BY compensation.created_at, compensation.id
     `;
   }
+
+  it('cancels a readiness probe and reuses its rolled-back connection', async () => {
+    const backendPids: number[] = [];
+    let readinessHookCalls = 0;
+    const readinessRepository = createPostgresControlPlaneRepository(appDatabaseUrl, {
+      afterReadinessTimeoutConfigured: async (tx) => {
+        const [backend] = await tx<{ pid: number }[]>`
+          SELECT pg_backend_pid() AS pid
+        `;
+        backendPids.push(backend!.pid);
+        if (readinessHookCalls++ === 0) {
+          await tx`SELECT pg_sleep(2)`;
+        }
+      },
+    });
+
+    try {
+      await expect(readinessRepository.checkReadiness(100)).rejects.toMatchObject({
+        code: '57014',
+      });
+      await expect(readinessRepository.checkReadiness(1000)).resolves.toBeUndefined();
+      expect(backendPids).toHaveLength(2);
+      expect(backendPids[1]).toBe(backendPids[0]);
+    } finally {
+      await readinessRepository.close();
+    }
+  });
+
+  it.each([0, -1, 1.5, Number.NaN, 10001])(
+    'rejects invalid readiness timeout %s before running its hook',
+    async (timeoutMs) => {
+      let readinessHookCalls = 0;
+      const readinessRepository = createPostgresControlPlaneRepository(appDatabaseUrl, {
+        afterReadinessTimeoutConfigured: () => {
+          readinessHookCalls += 1;
+        },
+      });
+
+      try {
+        await expect(readinessRepository.checkReadiness(timeoutMs)).rejects.toThrow(
+          new RangeError('Database readiness timeout must be 1..10000ms'),
+        );
+        expect(readinessHookCalls).toBe(0);
+      } finally {
+        await readinessRepository.close();
+      }
+    },
+  );
 
   it('bootstraps concurrent identical commands once and compares exact UTF-8 canonical payloads', async () => {
     const input = {

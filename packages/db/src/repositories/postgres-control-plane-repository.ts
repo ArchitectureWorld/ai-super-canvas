@@ -213,6 +213,7 @@ interface CompensationRow {
 
 export interface PostgresControlPlaneRepositoryHooks {
   afterHydrateSnapshotEstablished?: () => Promise<void> | void;
+  afterReadinessTimeoutConfigured?: (tx: postgres.TransactionSql) => Promise<void> | void;
 }
 
 const defaultFakeModel: LocalAlphaModelSeed = {
@@ -867,7 +868,18 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     private readonly databaseUrl: string,
     private readonly hooks: PostgresControlPlaneRepositoryHooks = {},
   ) {
-    this.sql = postgres(databaseUrl, { max: 10 });
+    this.sql = postgres(databaseUrl, { max: 10, connect_timeout: 1 });
+  }
+
+  async checkReadiness(timeoutMs = 1000): Promise<void> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10_000) {
+      throw new RangeError('Database readiness timeout must be 1..10000ms');
+    }
+    await this.sql.begin(async (tx) => {
+      await tx`SELECT set_config('statement_timeout', ${`${timeoutMs}ms`}, true)`;
+      await this.hooks.afterReadinessTimeoutConfigured?.(tx);
+      await tx`SELECT 1 AS ready`;
+    });
   }
 
   private async authorizeWorkflow(

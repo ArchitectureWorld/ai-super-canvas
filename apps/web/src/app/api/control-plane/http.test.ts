@@ -1,0 +1,293 @@
+import { z } from 'zod';
+import {
+  ControlPlaneApplicationError,
+} from '@ai-super-canvas/control-plane';
+import {
+  ActiveRunConflictError,
+  AuthorizationError,
+  CommandPayloadConflictError,
+  RunIdempotencyConflictError,
+  RunStateConflictError,
+} from '@ai-super-canvas/db';
+import { describe, expect, it, vi } from 'vitest';
+
+import {
+  HttpError,
+  errorResponse,
+  noStoreJson,
+  parseAfter,
+  parseJson,
+  parseUuid,
+} from './http';
+
+const request = (body: string, headers?: HeadersInit) => new Request(
+  'http://localhost/api/control-plane',
+  {
+    body,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...headers,
+    },
+  },
+);
+
+async function responseBody(response: Response) {
+  return response.json() as Promise<{
+    error?: { code: string; message: string; retryable: boolean };
+    commandReceiptId?: string;
+  }>;
+}
+
+function expectNoStore(response: Response) {
+  expect(response.headers.get('cache-control')).toBe('no-store');
+}
+
+describe('control-plane HTTP boundary', () => {
+  it('rejects a cross-site simple POST before parsing its valid JSON body', async () => {
+    const reason = await parseJson(
+      request(JSON.stringify({ name: 'forged' }), {
+        'Content-Type': 'text/plain',
+        Origin: 'https://attacker.example',
+      }),
+      z.object({ name: z.string() }),
+    ).catch((error: unknown) => error);
+    const response = errorResponse(reason);
+
+    expect(response.status).toBe(415);
+    expect(await responseBody(response)).toEqual({
+      error: {
+        code: 'unsupported_media_type',
+        message: 'Request body must use application/json',
+        retryable: false,
+      },
+    });
+    expectNoStore(response);
+  });
+
+  it('rejects a cross-origin JSON POST before parsing its valid body', async () => {
+    const reason = await parseJson(
+      request(JSON.stringify({ name: 'forged' }), {
+        Origin: 'https://attacker.example',
+      }),
+      z.object({ name: z.string() }),
+    ).catch((error: unknown) => error);
+    const response = errorResponse(reason);
+
+    expect(response.status).toBe(403);
+    expect(await responseBody(response)).toEqual({
+      error: {
+        code: 'forbidden_origin',
+        message: 'Cross-origin requests are not allowed',
+        retryable: false,
+      },
+    });
+    expectNoStore(response);
+  });
+
+  it.each([
+    ['same-origin browser request', { Origin: 'http://localhost' }],
+    ['non-browser request without Origin', undefined],
+  ])('accepts JSON from a %s', async (_description, headers) => {
+    await expect(parseJson(
+      request(JSON.stringify({ name: 'local' }), headers),
+      z.object({ name: z.string() }),
+    )).resolves.toEqual({ name: 'local' });
+  });
+
+  it('accepts a browser Origin matching Host when the internal URL is canonicalized', async () => {
+    const canonicalizedRequest = new Request(
+      'http://localhost:3000/api/control-plane',
+      {
+        body: JSON.stringify({ name: 'local' }),
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Host: '127.0.0.1:3000',
+          Origin: 'http://127.0.0.1:3000',
+        },
+      },
+    );
+
+    await expect(parseJson(
+      canonicalizedRequest,
+      z.object({ name: z.string() }),
+    )).resolves.toEqual({ name: 'local' });
+  });
+
+  it.each([
+    [
+      'a cross-site Origin targeting a loopback Host',
+      '127.0.0.1:3000',
+      'https://attacker.example',
+    ],
+    [
+      'a DNS-rebinding authority even when Host and Origin match',
+      'attacker.example:3000',
+      'http://attacker.example:3000',
+    ],
+  ])('rejects %s', async (_description, host, origin) => {
+    const untrustedRequest = new Request(
+      'http://localhost:3000/api/control-plane',
+      {
+        body: JSON.stringify({ name: 'forged' }),
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Host: host,
+          Origin: origin,
+        },
+      },
+    );
+
+    await expect(parseJson(
+      untrustedRequest,
+      z.object({ name: z.string() }),
+    )).rejects.toMatchObject({
+      status: 403,
+      code: 'forbidden_origin',
+    });
+  });
+
+  it('maps malformed JSON to a sanitized no-store 400 response', async () => {
+    const reason = await parseJson(request('{'), z.object({ name: z.string() })).catch(
+      (error: unknown) => error,
+    );
+    const response = errorResponse(reason);
+
+    expect(response.status).toBe(400);
+    expect(await responseBody(response)).toEqual({
+      error: { code: 'malformed_json', message: 'Request body must be valid JSON', retryable: false },
+    });
+    expectNoStore(response);
+  });
+
+  it('rejects server-owned fields with a strict request schema', async () => {
+    const reason = await parseJson(
+      request(JSON.stringify({ clientValue: 'ok', serverOwned: 'forged' })),
+      z.object({ clientValue: z.string() }).strict(),
+    ).catch((error: unknown) => error);
+    const response = errorResponse(reason);
+
+    expect(response.status).toBe(400);
+    expect(await responseBody(response)).toEqual({
+      error: { code: 'invalid_request', message: 'Request validation failed', retryable: false },
+    });
+    expectNoStore(response);
+  });
+
+  it.each([
+    [new CommandPayloadConflictError('command-1'), 'command_payload_conflict'],
+    [new ActiveRunConflictError('session-1'), 'active_run_conflict'],
+    [new RunIdempotencyConflictError('key-1'), 'run_idempotency_conflict'],
+    [new RunStateConflictError('internal state detail'), 'run_state_conflict'],
+  ])('sanitizes %s as a stable conflict response', async (reason, code) => {
+    const response = errorResponse(reason);
+
+    expect(response.status).toBe(409);
+    expect(await responseBody(response)).toEqual({
+      error: { code, message: 'Request conflicts with the current server state', retryable: false },
+    });
+    expectNoStore(response);
+  });
+
+  it('sanitizes authorization errors as not found', async () => {
+    const response = errorResponse(new AuthorizationError());
+
+    expect(response.status).toBe(404);
+    expect(await responseBody(response)).toEqual({
+      error: { code: 'not_found', message: 'Resource not found', retryable: false },
+    });
+    expectNoStore(response);
+  });
+
+  it.each([
+    ['command_requires_reconciliation', true, 202, 'receipt-1'],
+    ['command_persistence_unconfirmed', true, 202, 'receipt-1'],
+    ['runtime_session_unavailable', false, 409, 'receipt-2'],
+    ['runtime_operation_failed', true, 500, 'receipt-2'],
+  ] as const)('maps application error %s with its stable retryability', async (code, retryable, status, receiptId) => {
+    const response = errorResponse(new ControlPlaneApplicationError(code, 'safe application message', retryable, receiptId));
+    const body = await responseBody(response);
+
+    expect(response.status).toBe(status);
+    expect(body.error).toEqual({
+      code,
+      message: 'safe application message',
+      retryable,
+    });
+    if (status === 202) {
+      expect(response.headers.get('retry-after')).toBe('2');
+    }
+    expect(body.commandReceiptId).toBe(receiptId);
+    expectNoStore(response);
+  });
+
+  it('omits commandReceiptId from an accepted response when none is available', async () => {
+    const response = errorResponse(
+      new ControlPlaneApplicationError(
+        'command_requires_reconciliation',
+        'safe application message',
+        true,
+      ),
+    );
+    const body = await responseBody(response);
+
+    expect(response.status).toBe(202);
+    expect(body).not.toHaveProperty('commandReceiptId');
+    expectNoStore(response);
+  });
+
+  it('does not leak unexpected errors and logs only their name', async () => {
+    const logger = { error: vi.fn() };
+    const response = errorResponse(new Error('database password is secret'), logger);
+
+    expect(response.status).toBe(500);
+    expect(await responseBody(response)).toEqual({
+      error: { code: 'internal_error', message: 'An unexpected error occurred', retryable: false },
+    });
+    expectNoStore(response);
+    expect(logger.error).toHaveBeenCalledExactlyOnceWith('control_plane_request_failed', { errorName: 'Error' });
+  });
+
+  it('uses the default logger without leaking the unexpected error', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      const response = errorResponse(new Error('database password is secret'));
+
+      expect(consoleError).toHaveBeenCalledExactlyOnceWith(
+        'control_plane_request_failed',
+        { errorName: 'Error' },
+      );
+      expectNoStore(response);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it('accepts only UUID values', () => {
+    expect(parseUuid('550e8400-e29b-41d4-a716-446655440000')).toBe('550e8400-e29b-41d4-a716-446655440000');
+    expect(() => parseUuid('not-a-uuid')).toThrow(new HttpError(400, 'invalid_request', 'Request validation failed'));
+  });
+
+  it('accepts only non-negative safe integer pagination offsets', () => {
+    expect(parseAfter(new Request('http://localhost'))).toBe(0);
+    expect(parseAfter(new Request('http://localhost?after=12'))).toBe(12);
+    for (const value of ['-1', '1.5', '9007199254740992', 'abc']) {
+      expect(() => parseAfter(new Request(`http://localhost?after=${value}`))).toThrow(
+        new HttpError(400, 'invalid_request', 'Request validation failed'),
+      );
+    }
+  });
+
+  it('forces no-store JSON while retaining response status and other headers', async () => {
+    const response = noStoreJson({ ok: true }, { status: 201, headers: { 'X-Request-Id': 'request-1', 'Cache-Control': 'public, max-age=60' } });
+
+    expect(response.status).toBe(201);
+    expect(response.headers.get('x-request-id')).toBe('request-1');
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(response.headers.get('content-type')).toContain('application/json');
+    expect(await response.json()).toEqual({ ok: true });
+  });
+});

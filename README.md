@@ -55,8 +55,17 @@ Open `http://127.0.0.1:3000` after the development server starts.
 ```bash
 cp .env.example .env
 # Replace POSTGRES_PASSWORD in .env before continuing.
-docker compose up --build --detach
+docker compose up --detach postgres
+docker build --target test --tag ai-super-canvas:migrator .
+docker run --rm \
+  --network ai-super-canvas_default \
+  --env-file .env \
+  --entrypoint sh \
+  ai-super-canvas:migrator \
+  -eu -c 'export DATABASE_URL="postgres://${POSTGRES_USER:-canvas}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-canvas}"; pnpm --filter @ai-super-canvas/db db:migrate'
+docker compose up --build --detach app
 curl --fail http://127.0.0.1:3000/api/health
+curl --fail http://127.0.0.1:3000/api/ready
 ```
 
 Stop the stack without deleting the persistent PostgreSQL volume:
@@ -65,7 +74,10 @@ Stop the stack without deleting the persistent PostgreSQL volume:
 docker compose down
 ```
 
-The current `/api/health` route is a web liveness signal. Database-backed readiness is a documented follow-up.
+`/api/health` is the web liveness signal. `/api/ready` checks the shared PostgreSQL
+connection with bounded timeouts and returns `503` when the database is unavailable.
+Schema migrations must complete before the application starts serving control-plane
+requests; see [the Linux / NAS deployment guide](docs/deployment/linux-nas-docker.md).
 
 ## Commands and test status
 

@@ -99,6 +99,25 @@ Golden Path：
 -> 明确证明内存 FakeRuntime 不虚报跨进程恢复
 ```
 
+#### 2026-07-26 本地 Alpha 落地证据
+
+- 新增独立页面 `/control-plane-test`，页面直接调用服务器持久化
+  Session、Run、transcript 和 RunEvent API；它不是旧 `/` 画布的入口或换皮。
+- 浏览器只在 localStorage 保存最后一个 Session ID，刷新后的消息、回复和
+  Run 事件全部从 PostgreSQL 重新读取。
+- `DeterministicFakeRuntime` 重启后不会复用旧的外部 Session/Run 引用；旧
+  Runtime 引用会明确显示为不可用，用户可以新建不同的 Session 并继续运行。
+- 本地生产镜像构建通过；Node 24 单元测试 `342/342`、隔离 PostgreSQL
+  集成测试 `91/91`、Playwright 新页面与旧首页回归 `10/10`。
+- 一次性真实重启验收 `3673abea-6977-4f34-8066-d76b37255055` 以提交
+  `356fe648` 和镜像
+  `sha256:bd9409e8fbd6d29c3fe02464c2cfe575df1909e6b4241a71dbfdd33cd1cf7797`
+  为基线，证明重启前后容器身份发生变化、镜像不变、旧历史可恢复、新
+  Session ID 不同、新 Run 完成且再次刷新后仍可读取。
+- 当前部署仍严格限制在 `127.0.0.1:3000`。本页尚未覆盖 fork、取消和审批，
+  LAN/TLS 与真实 Hermes Runtime 恢复也仍是后续 gate；这些边界不能被本次
+  FakeRuntime 验收冒充为完整 S1/S2 退出。
+
 退出条件：Golden Path 全部由自动化测试证明，前端尚未接入也可通过 API 完成。Runtime 原生跨重启恢复仍属于 S2 Hermes gate，不由 S1 Fake 的内存行为冒充。
 
 ### S2：Hermes ACP 能力 Spike

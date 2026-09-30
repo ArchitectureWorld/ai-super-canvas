@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import {
   RuntimeAdapterError,
   RuntimeCapabilityError,
@@ -97,6 +99,22 @@ function notApplied(code: RuntimeErrorCode, message: string): RuntimeAdapterErro
   return new RuntimeAdapterError(code, message, false, 'not-applied');
 }
 
+function externalResourceRef(
+  kind: 'run' | 'session',
+  binding: RuntimeBindingContext,
+  canvasResourceId: string,
+): string {
+  const digest = createHash('sha256')
+    .update(JSON.stringify([
+      binding.canvasAgentBindingId,
+      binding.isolationKey,
+      canvasResourceId,
+    ]))
+    .digest('hex')
+    .slice(0, 24);
+  return `fake-${kind}-${digest}`;
+}
+
 function cloneRuntimeInput<T>(value: T): T {
   try {
     return clone(value);
@@ -130,8 +148,6 @@ export class DeterministicFakeRuntime implements RuntimeAdapter {
   private readonly runs = new Map<string, FakeRun>();
   private readonly activeRunsBySession = new Map<string, string>();
   private readonly usedCommands = new Map<string, UsedCommand>();
-  private nextSessionSequence = 1;
-  private nextRunSequence = 1;
   private nextSessionOrder = 1;
 
   async describe(binding: RuntimeBindingContext): Promise<RuntimeDescriptor> {
@@ -268,7 +284,11 @@ export class DeterministicFakeRuntime implements RuntimeAdapter {
       throw notApplied('transcript_conflict', 'Run prompt is not a valid transcript message');
     }
 
-    const externalRunRef = `fake-run-${this.nextRunSequence}`;
+    const externalRunRef = externalResourceRef(
+      'run',
+      input.binding,
+      input.canvasRunId,
+    );
     const acceptedAt = new Date(0).toISOString();
     const storedInput = cloneRuntimeInput(input);
     const prompt = storedInput.prompt;
@@ -276,7 +296,6 @@ export class DeterministicFakeRuntime implements RuntimeAdapter {
     const nextDigest = digestRuntimeTranscript(nextTranscript);
     const events = this.createRunEvents(storedInput, externalRunRef, acceptedAt);
 
-    this.nextRunSequence += 1;
     this.markCommand(input.binding, input.commandId, 'startRun');
     session.transcript = nextTranscript;
     session.historyDigest = nextDigest;
@@ -535,7 +554,11 @@ export class DeterministicFakeRuntime implements RuntimeAdapter {
     lineage: RuntimeSessionRef['lineage'],
     operation: UsedCommand['operation'],
   ): RuntimeSessionRef {
-    const externalSessionRef = `fake-session-${this.nextSessionSequence}`;
+    const externalSessionRef = externalResourceRef(
+      'session',
+      input.binding,
+      input.canvasSessionId,
+    );
     const storedTranscript = cloneRuntimeInput([...transcript]);
     const storedModel = cloneRuntimeInput(input.model);
     const storedToolPolicy = cloneRuntimeInput(input.toolPolicy);
@@ -556,7 +579,6 @@ export class DeterministicFakeRuntime implements RuntimeAdapter {
       createdOrder: this.nextSessionOrder,
     };
 
-    this.nextSessionSequence += 1;
     this.nextSessionOrder += 1;
     this.markCommand(input.binding, input.commandId, operation);
     this.sessions.set(externalSessionRef, session);
