@@ -15,7 +15,7 @@
     "@ai-super-canvas/control-plane": "workspace:*",
     "@ai-super-canvas/core": "workspace:*",
     "@ai-super-canvas/db": "workspace:*",
-    "next": "16.3.7",
+    "next": "16.3.8",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "server-only": "0.0.1",
